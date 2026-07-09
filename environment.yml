@@ -1,0 +1,40 @@
+# DEPRECATED: Use `uv sync` with pyproject.toml instead.
+# This file is kept for reference only.
+name: motifscreen
+channels:
+  - pytorch
+  - dglteam/label/cu117
+  - conda-forge
+  - defaults
+dependencies:
+  # Core
+  - python=3.9
+  - pip
+
+  # PyTorch with CUDA 11.7
+  - pytorch=1.13.1
+  - pytorch-cuda=11.7
+
+  # DGL (Deep Graph Library)
+  - dgl=1.1.3=*cu117*
+
+  # Scientific computing
+  - numpy>=1.24
+  - scipy>=1.10
+  - pandas>=1.5
+  - scikit-learn>=1.2
+
+  # Chemistry
+  - rdkit>=2023.03
+  - openbabel>=3.1
+
+  # Visualization & utilities
+  - matplotlib>=3.7
+  - tqdm
+  - pyyaml
+
+  # Pip-only packages
+  - pip:
+    - e3nn==0.5.1
+    - wandb>=0.15
+    - fair-esm>=2.0.0

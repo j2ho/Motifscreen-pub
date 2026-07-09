@@ -1,0 +1,198 @@
+model:
+  name: "asm-brc-transfer20"
+  version: "ablation"
+
+  common:
+    dropout_rate: 0.2
+
+  # Grid network parameters
+  grid:
+    model: "se3" # 'se3', 'egnn', 'egnn_attention', 'egnn_coords'
+    num_layers_grid: 5 # 5 for 'se3'
+    l0_in_features: 102
+    n_heads: 4
+    num_channels: 32
+    num_edge_features: 3
+    l0_out_features: 64
+    ntypes: 6
+
+  # Ligand network parameters
+  ligand:
+    model: "gat"  # Model type for ligand processing
+    num_layers: 4
+    l0_in_features: 18
+    l0_out_features: 64
+    n_heads: 4
+    num_channels: 32
+    num_edge_features: 5
+    n_lig_global_in: 19
+    n_lig_global_out: 4
+
+  # trigonal related, but output dims can affect other modules (e.g., ClassModule)
+  TR:
+    d: 64
+    # m: 64 (removed - now uses featurizer output dimensions)
+    c: 64
+    n_trigon_lig_layers: 2
+    n_trigon_key_layers: 3
+    shared_trigon: false
+    normalize_Xform: true
+    lig_to_key_attn: true
+    trigon_module: 'trigon' # 'optimized'
+
+  aff:
+    classification_mode: "former_contrast"
+    dropoutmode: "harsh"
+
+# Training parameters
+training:
+  load_checkpoint: true
+  use_ema: false
+  ema_decay: 0.9999
+  lr: 5.0e-5
+  max_epoch: 500
+  accumulation_steps: 1
+  debug: false
+  ddp: true
+  silent: false
+  amp: false
+  wandb_mode: "online"
+  log_steps: true
+  weight_decay: 1.0e-4  # L2 regularization via optimizer weight decay
+  max_param_norm: 25.0  # Maximum parameter norm before warning
+  custom_init: false  # Custom initialization flag, can be used to trigger specific init logic
+  gradient_checkpoint: true  # Gradient checkpointing to reduce VRAM usage
+
+  # Learning rate scheduler configuration
+  scheduler:
+    use_scheduler: false
+    scheduler_type: "ReduceLROnPlateau"  # Options: "ReduceLROnPlateau", "StepLR", "CosineAnnealingLR", "None"
+    # ReduceLROnPlateau parameters
+    factor: 0.8          # Factor by which LR is reduced
+    patience: 3          # Number of epochs with no improvement after which LR is reduced
+    min_lr: 1.0e-6       # Minimum learning rate
+    threshold: 1.0e-4    # Threshold for measuring new optimum
+    # StepLR parameters (used if scheduler_type is "StepLR")
+    step_size: 50        # Period of learning rate decay
+    gamma: 0.1           # Multiplicative factor of learning rate decay
+    # CosineAnnealingLR parameters (used if scheduler_type is "CosineAnnealingLR")
+    T_max: 100           # Maximum number of iterations
+
+# Data parameters
+data:
+  datapath: "data/training/"
+  train_file: "data/final-set-260301/pbc_train.txt"
+  valid_file: "data/final-set-260301/pbc_valid.txt"
+  decoyf: 'data/final-set-260301/pb_decoy_map_260301.pkl'
+  crossreceptorf: "data/crossreceptor_filtered2.tsv"
+  keyatomf: "keyatom.def.npz"
+  ball_radius: 8.0
+  ball_radius_var: 1.0
+  edgedist: [2.2, 4.5]
+  edgemode: "topk"
+  edgek: [8, 16]
+  randomize: 0.2
+  ntype: 6
+  maxedge: 37000
+  maxnode: 3000
+  drop_H: true
+  max_subset: 20 #10
+
+# Data loader parameters
+dataloader:
+  batch_size: 1
+  num_workers: 8
+  pin_memory: true
+  shuffle: true
+
+# Loss weights - No warmup needed (structure modules are pretrained)
+# Each weight is the direct effective weight (no compound nesting)
+losses:
+  # Motif
+  w_motif: 2.5               # Motif BCE (pos + neg)
+  w_motif_contrast: 2.0      # Motif contrast — penalize preds on unlabeled grids
+  w_motif_penalty: 0.0       # Motif logit penalty (disabled)
+
+  # Structure (no warmup - already pretrained)
+  w_str: 0.5                 # Key atom coordinate MSE
+  w_str_pair: 0.5            # Pairwise distance loss (old: w_str × w_str_pair = 0.5×1.0)
+  w_str_attmap: 1.5          # Attention spread loss (old: w_str × w_str_attmap = 0.5×5.0)
+  w_str_warmup_epochs: 0
+  w_str_warmup_multiplier: 1.0
+
+  # Screening
+  w_screen_bce: 2.0
+  w_screen_rank: 4.0
+  w_screen_contrast: 2.0
+
+  # Regularization
+  w_penalty: 1.0e-5
+
+  # Loss options
+  screen_rank_type: "pairwise_auc"
+  struct_loss: "mse"
+
+  # Per-source total loss weight
+  source_loss_weight:
+    pdbbind: 1.5
+    chembl: 1.2
+    biolip: 1.0
+
+# Ablation study configuration
+ablation:
+  # Module ablations
+  enable_structure_module: true
+  enable_keyatom_trimming: true
+  enable_lig_to_key_attn: true
+  enable_trigon_lig: true
+  enable_trigon_key_layers: true
+  enable_xform_modules: true
+  enable_distance_transform: true
+
+  # Loss ablations - Motif
+  ablate_motif_loss: false
+  ablate_motif_contrast_loss: false
+
+  # Loss ablations - Structure
+  ablate_structure_loss: false
+  ablate_str_pair_loss: false
+  ablate_str_attmap_loss: false
+
+  # Loss ablations - Screening
+  ablate_screen_bce_loss: false
+  ablate_screen_rank_loss: false
+  ablate_screen_contrast_loss: false
+
+  # Dataset ablations
+  ablate_pdbbind: false
+  ablate_biolip: false
+  ablate_chembl: false
+
+  # Component-specific ablations
+  skip_grid_projection: false
+  skip_key_projection: false
+  num_trigon_key_layers: null
+  num_trigon_lig_layers: null
+
+
+# Cross-validation and data augmentation
+cross_validation:
+  load_cross: true
+  cross_eval_struct: true
+  cross_val_prob: 0.3
+  cross_grid: 1.0
+  nonnative_struct_weight: 0.2
+  motif_otf: false
+
+# Conformer augmentation settings
+augmentation:
+  use_conformers: true          # Master toggle for conformer augmentation
+  conformer_prob: 0.4            # Probability of using conformer for active ligands
+  conformer_suffix: "_conf.mol2" # Suffix for conformer files (e.g., {pname}_conf.mol2)
+  conformer_validation: false    # Whether to use conformers during validation
+
+# Other data settings
+misc:
+  pert: false  # Unused in dataset_jiho.py (replaced by use_conformers)
+  randomize_grid: 0.0  # Disabled - was buggy (shifted key_xyz relative to grids)
+  firstshell_as_grid: false

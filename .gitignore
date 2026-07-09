@@ -1,0 +1,32 @@
+*~
+**/__pycache__/
+**/*.pyc
+
+# uv virtual environment
+.venv/
+
+# Runtime / output directories
+models/
+logs/
+wandb/
+results/
+slurm_logs/
+runs/
+
+# Tool configs
+.claude/
+.serena/
+.codex
+.pytest_cache/
+
+# Large binary data (checkpoints, npz caches)
+*.pkl
+*.npz
+# But keep example npz files for the demo
+!data/example/**/*.npz
+!data/inference_example/**/*.npz
+
+# OS / editor
+.DS_Store
+.*.un~
+.*.swp

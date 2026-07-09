@@ -1,0 +1,18 @@
+# DUD-E benchmark configuration
+# Data structure: {datapath}/{target}.{grid,prop,active,decoy,keyatom}.npz/mol2
+
+model:
+  checkpoint: "models/asm-strup-cross/best.pkl"
+  base_config: "configs/training/endtoend.yaml"
+
+data:
+  # Flat directory with all preprocessed DUD-E files
+  datapath: "~/DB/for_msk/DUDE"
+  # CSV with target_name column, or TXT with one target per line
+  targets_file: "data/dude_targets.csv"
+
+inference:
+  batch_size: 20
+  output_dir: "results/dude-asm-strup-cross/"
+  combined_output: "results/dude_all_scores-asm-strup-cross.csv"
+  device: "cuda"

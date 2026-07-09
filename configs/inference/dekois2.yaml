@@ -1,0 +1,16 @@
+# DEKOIS2 benchmark: 74 targets, ~40 actives + ~1100 decoys per target
+# Data: single mol2 per target with BDB (active) + ZINC (decoy) compounds
+
+model:
+  checkpoint: "models/asm-strup-cross/best.pkl"
+  base_config: "configs/training/endtoend.yaml"
+
+data:
+  datapath: "data/DEKOIS2"
+  targets_file: "data/dekois2_targets.txt"
+
+inference:
+  batch_size: 16
+  output_dir: "results/dekois2/"
+  combined_output: "results/dekois2/all_scores.csv"
+  device: "cuda"

@@ -1,0 +1,18 @@
+# Example inference configuration
+# Uses data/inference_example/ with aldr and cdk2 targets
+
+model:
+  checkpoint: "models/asm-ce-2/best.pkl"
+  base_config: "configs/training/endtoend.yaml"
+
+data:
+  datapath: "data/inference_example_str"
+  targets_file: "data/inference_example_targets_str.txt"
+  mol2_pattern: "*.mol2"
+
+inference:
+  batch_size: 20
+  output_dir: "results/inference_example/"
+  output_pattern: "{target_id}_scores.csv"
+  combined_output: "results/inference_example_all_scores.csv"
+  device: "cuda"
