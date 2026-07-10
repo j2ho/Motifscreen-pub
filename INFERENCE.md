@@ -40,16 +40,31 @@ No Rosetta installation needed. Rosetta parameter files for atom typing are bund
 
 The model was trained on protonated structures. Missing hydrogens will degrade prediction quality, particularly for hydrogen bond donor/acceptor features and partial charge assignment.
 
-**You should add hydrogens before running `prepare`.** Options:
+**Recommended: Rosetta `score_jd2`.** This is what the model was trained with. Best atom-name consistency with the featurizer, and best downstream numbers if you want to reproduce paper results exactly:
 
 ```bash
+# Requires a Rosetta install (free for academic use, register at rosettacommons.org)
+score_jd2.linuxgccrelease -s receptor.pdb -out:file:scorefile /dev/null \
+    -no_optH false -out:pdb -overwrite -out:path:pdb .
+# produces receptor_0001.pdb
+
+# Or point prepare.py at your Rosetta binary and let it protonate for you:
+uv run python motifscreen.py prepare \
+    --protein receptor.pdb \
+    --protonate-rosetta /path/to/score_jd2.linuxgccrelease \
+    ...
+```
+
+If Rosetta isn't installed, any of the following work fine in practice (with mild quality/coverage tradeoffs):
+
+```bash
+# reduce (Richardson lab, MIT license; usually preinstalled on Linux)
+reduce -BUILD receptor.pdb > receptor_h.pdb
+
 # OpenBabel (simplest, works for most cases)
 obabel receptor.pdb -O receptor_h.pdb -h
 
-# reduce (better H placement for proteins, free from Richardson lab)
-reduce -BUILD receptor.pdb > receptor_h.pdb
-
-# PDBFixer (Python, handles missing residues too)
+# PDBFixer (Python, also handles missing residues)
 # pip install pdbfixer
 python -c "
 from pdbfixer import PDBFixer
@@ -63,7 +78,7 @@ PDBFile.writeFile(fixer.topology, fixer.positions, open('receptor_h.pdb', 'w'))
 "
 ```
 
-`prepare` will still run without hydrogens, but results won't be reliable. A warning is printed if no hydrogens are detected.
+`prepare` runs regardless of which tool you used, but expect ~1-3% of common PDBs to have residues with non-standard atom naming (metals, cofactors, alt-locs). The featurizer logs a warning and skips those residues rather than aborting.
 
 ## Step 1: Prepare
 

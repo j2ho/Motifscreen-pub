@@ -150,12 +150,21 @@ def featurize_target_properties(pdb,npz,extrapath="",verbose=False):
         if iaa >= myutils.ALL_AAS.index("CA"):
             iaa = myutils.ALL_AAS.index("CA")
             atypes = atypes_aa[iaa]
-            
+
+        # If the rep-atom is missing (protonation-tool edge case, non-standard
+        # atom name, alt-loc stripped), skip the residue rather than aborting
+        # the whole target. Non-rep missing atoms are already skipped below.
+        if atms[repsatm] not in xyz[reschain]:
+            logger.warning(
+                f"Missing rep atom {atms[repsatm]} in {reschain} ({resname}), skipping residue"
+            )
+            skipres.append(i)
+            continue
+
         for iatm,atm in enumerate(atms):
             is_repsatm = (iatm == repsatm)
-            
+
             if atm not in xyz[reschain]:
-                if is_repsatm: return False
                 continue
                 
             atms_r.append(atm)
