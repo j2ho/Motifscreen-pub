@@ -143,6 +143,61 @@ def _file_ok(path: str) -> bool:
     return os.path.exists(path) and os.path.getsize(path) > 0
 
 
+# Common cofactors + metal ions that should be kept as part of the receptor.
+# Drug-like HETATMs are stripped by default.
+DEFAULT_KEEP_HETATMS = frozenset([
+    # Metals
+    'ZN', 'MG', 'CA', 'MN', 'FE', 'CU', 'K', 'NA', 'NI', 'CO', 'CD',
+    'CS', 'HG', 'PB', 'SR', 'PT', 'AU', 'AG', 'LI', 'BA', 'RB',
+    # Iron-sulfur clusters, hemes
+    'FES', 'FE2', 'SF4', 'F3S', 'HEM', 'HEC', 'HEA', 'HEB', 'HED',
+    # Nucleotide cofactors
+    'NAD', 'NAI', 'NAP', 'NDP', 'FAD', 'FMN', 'FMR',
+    'ATP', 'ADP', 'AMP', 'GTP', 'GDP', 'GMP', 'CTP', 'UTP',
+    # Common cofactors
+    'PLP', 'PMP', 'COA', 'ACO', 'SAM', 'SAH', 'BTN', 'MDO', 'TPP',
+    'CLA', 'BCL', 'CLR',
+    # Waters (kept - scoring benefits from bridging waters)
+    'HOH', 'WAT', 'H2O', 'DOD',
+])
+
+
+def strip_protein_hetatms(input_pdb: str, output_pdb: str,
+                          extra_keep: set = None) -> tuple:
+    """Copy input_pdb to output_pdb, keeping ATOM records and whitelisted HETATMs.
+
+    Drug-like HETATMs (crystal ligands, buffer components, non-standard residues
+    that are not in the cofactor whitelist) are dropped. This is important
+    because the featurizer includes HETATMs in receptor xyz for grid clash
+    filtering - a crystal ligand would carve out grid points in the pocket
+    itself, degrading downstream scoring.
+
+    Returns (n_atom, n_hetatm_kept, dropped_resnames_dict).
+    """
+    keep_hetatms = set(DEFAULT_KEEP_HETATMS)
+    if extra_keep:
+        keep_hetatms |= set(r.strip().upper() for r in extra_keep)
+
+    n_atom = 0
+    n_hetatm_kept = 0
+    dropped = {}  # resname -> count
+    with open(input_pdb) as fin, open(output_pdb, 'w') as fout:
+        for line in fin:
+            if line.startswith('ATOM'):
+                n_atom += 1
+                fout.write(line)
+            elif line.startswith('HETATM'):
+                resname = line[17:20].strip().upper()
+                if resname in keep_hetatms:
+                    n_hetatm_kept += 1
+                    fout.write(line)
+                else:
+                    dropped[resname] = dropped.get(resname, 0) + 1
+            elif line.startswith(('TER', 'END', 'CONECT', 'MODEL', 'ENDMDL', 'HEADER')):
+                fout.write(line)
+    return n_atom, n_hetatm_kept, dropped
+
+
 def count_mol2_compounds(mol2_path: str) -> int:
     count = 0
     with open(mol2_path) as f:
@@ -161,7 +216,8 @@ def prepare(protein_pdb: str, ligands_file: str,
             workers: int = 4,
             gridsize: float = 1.5,
             padding: float = 10.0,
-            clash: float = 1.1):
+            clash: float = 1.1,
+            keep_hetatms: list = None):
     """Run full preparation pipeline."""
 
     if target_id is None:
@@ -170,14 +226,26 @@ def prepare(protein_pdb: str, ligands_file: str,
     target_dir = Path(output_dir) / target_id
     target_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. Protein protonation (optional)
+    # 1a. Strip drug-like HETATMs from protein PDB (keep cofactors and metals).
+    # If left in, the featurizer treats them as receptor atoms, and their
+    # clash volumes carve holes in the pocket grid.
+    stripped_pdb = str(target_dir / f"{target_id}_stripped.pdb")
+    n_atom, n_het, dropped = strip_protein_hetatms(
+        protein_pdb, stripped_pdb, extra_keep=keep_hetatms)
+    if dropped:
+        drop_summary = ", ".join(f"{r}({c})" for r, c in sorted(dropped.items()))
+        logger.info(f"Dropped {sum(dropped.values())} non-cofactor HETATM lines: {drop_summary}")
+        logger.info(f"  (to keep any of these, use --keep-hetatms RES1,RES2,...)")
+    logger.info(f"Protein: {n_atom} ATOM + {n_het} whitelisted HETATM lines")
+
+    # 1b. Protein protonation (optional)
     if protonate_rosetta_bin:
         prot_pdb = str(target_dir / f"{target_id}_H.pdb")
-        if not protonate_rosetta(protein_pdb, prot_pdb, protonate_rosetta_bin):
+        if not protonate_rosetta(stripped_pdb, prot_pdb, protonate_rosetta_bin):
             sys.exit(1)
     else:
-        prot_pdb = protein_pdb
-        logger.info(f"Using protein PDB as-is: {prot_pdb}")
+        prot_pdb = stripped_pdb
+        logger.info(f"Using stripped protein PDB as-is: {prot_pdb}")
 
     # 2. Featurize protein -> grid.npz + prop.npz
     outprefix = str(target_dir / target_id)
@@ -201,11 +269,44 @@ def prepare(protein_pdb: str, ligands_file: str,
     logger.info(f"  -> {prop_npz}")
 
     # 3. Prepare ligand mol2
+    #
+    # NOTE ON ORDERING: BRICS runs on the RAW input mol2 (before obabel prep).
+    # This is because obabel's MMFF94 output uses Sybyl types that RDKit's mol2
+    # parser refuses (~75% drop rate observed on DUD-E). obabel preserves heavy
+    # atom names during charge assignment, so keyatom names from the raw mol2
+    # still match the final obabel-processed mol2 that predict reads.
     ligand_stem = Path(ligands_file).stem
     prepared_mol2 = str(target_dir / f"{ligand_stem}.mol2")
 
+    # 3a. BRICS on raw input (SDF -> mol2 first if needed)
+    input_suffix = Path(ligands_file).suffix.lower()
+    if input_suffix == '.sdf':
+        # Cheap raw SDF -> mol2 (no H addition, no charge assignment)
+        raw_mol2_for_brics = str(target_dir / f"{ligand_stem}_raw.mol2")
+        result = subprocess.run(
+            ['obabel', '-isdf', ligands_file, '-omol2', '-O', raw_mol2_for_brics],
+            capture_output=True, text=True)
+        if not _file_ok(raw_mol2_for_brics):
+            logger.error(f"SDF -> mol2 for BRICS input failed: {result.stderr}")
+            sys.exit(1)
+    else:
+        raw_mol2_for_brics = ligands_file
+
+    keyatom_npz = str(target_dir / f"{ligand_stem}.keyatom.def.npz")
+    logger.info(f"Computing key atoms on raw input (BRICS, {workers} workers)...")
+    launch_batched_ligand(
+        raw_mol2_for_brics,
+        N=workers,
+        collated_npz=keyatom_npz,
+    )
+    if not _file_ok(keyatom_npz):
+        logger.error("Key atom computation failed (no output)")
+        sys.exit(1)
+
+    # 3b. Ligand prep for inference-ready mol2 (H addition + MMFF94 charges).
+    # Skipped if user provided --skip-ligand-prep or has USER_CHARGES already.
     if skip_ligand_prep:
-        if Path(ligands_file).suffix.lower() == '.mol2':
+        if input_suffix == '.mol2':
             shutil.copy2(ligands_file, prepared_mol2)
         else:
             logger.error("--skip-ligand-prep requires mol2 input")
@@ -217,19 +318,6 @@ def prepare(protein_pdb: str, ligands_file: str,
 
     n_compounds = count_mol2_compounds(prepared_mol2)
     logger.info(f"  {n_compounds} compounds in {prepared_mol2}")
-
-    # 4. Compute key atoms -> keyatom.def.npz
-    keyatom_npz = str(target_dir / f"{ligand_stem}.keyatom.def.npz")
-    logger.info(f"Computing key atoms (BRICS decomposition, {workers} workers)...")
-    launch_batched_ligand(
-        prepared_mol2,
-        N=workers,
-        collated_npz=keyatom_npz,
-    )
-
-    if not _file_ok(keyatom_npz):
-        logger.error("Key atom computation failed (no output)")
-        sys.exit(1)
 
     # Verify keyatom coverage
     data = np.load(keyatom_npz, allow_pickle=True)
@@ -289,6 +377,10 @@ def main():
                         help='Grid padding around binding site (default: 10.0)')
     parser.add_argument('--clash', type=float, default=1.1,
                         help='Clash distance for grid filtering (default: 1.1)')
+    parser.add_argument('--keep-hetatms',
+                        help='Comma-separated extra HETATM residue names to keep '
+                             '(e.g. "MYR,SUC"). Metals and standard cofactors are '
+                             'kept automatically.')
 
     args = parser.parse_args()
 
@@ -312,6 +404,10 @@ def main():
         center = calculate_ligand_com(args.crystal_ligand)
         logger.info(f"Center from crystal ligand: [{center[0]:.2f}, {center[1]:.2f}, {center[2]:.2f}]")
 
+    keep_hetatms = None
+    if args.keep_hetatms:
+        keep_hetatms = [s.strip() for s in args.keep_hetatms.split(',') if s.strip()]
+
     prepare(
         protein_pdb=args.protein,
         ligands_file=args.ligands,
@@ -324,6 +420,7 @@ def main():
         gridsize=args.gridsize,
         padding=args.padding,
         clash=args.clash,
+        keep_hetatms=keep_hetatms,
     )
 
 
