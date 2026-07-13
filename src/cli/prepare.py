@@ -143,6 +143,59 @@ def _file_ok(path: str) -> bool:
     return os.path.exists(path) and os.path.getsize(path) > 0
 
 
+def canonicalize_mol2_atom_names(input_mol2: str, output_mol2: str) -> None:
+    """Rewrite mol2 atom names to <element><per-element-index> (C1, C2, ..., N1, N2, ...).
+
+    Two mol2 files run through this function will end up with matching atom
+    names on every heavy atom, provided obabel preserved heavy-atom ordering
+    (it does, for MMFF94 charge assignment on already-hydrogenated input).
+
+    Hydrogens get numbered independently (H1, H2, ...) - they never appear as
+    BRICS keyatoms so their naming doesn't affect keyatom lookup.
+    """
+    with open(input_mol2) as f:
+        lines = f.readlines()
+
+    per_elem_counter = {}
+    in_atom = False
+    out_lines = []
+    for line in lines:
+        # Reset counter per compound so names are stable across files that
+        # differ in inter-compound atom counts (e.g. after obabel adds H).
+        if line.startswith('@<TRIPOS>MOLECULE'):
+            per_elem_counter = {}
+            in_atom = False
+            out_lines.append(line)
+            continue
+        if line.startswith('@<TRIPOS>ATOM'):
+            in_atom = True
+            out_lines.append(line)
+            continue
+        if line.startswith('@<TRIPOS>'):
+            in_atom = False
+            out_lines.append(line)
+            continue
+        if in_atom and line.strip():
+            parts = line.split()
+            if len(parts) >= 6:
+                elem_atomtype = parts[5]  # e.g. "C.ar", "N.pl3", "H"
+                elem = elem_atomtype.split('.')[0]
+                per_elem_counter[elem] = per_elem_counter.get(elem, 0) + 1
+                parts[1] = f'{elem}{per_elem_counter[elem]}'
+                # Rebuild the line preserving the original whitespace layout
+                # (mol2 is fixed-width-ish; use consistent spacing)
+                out_lines.append(
+                    '{:>7s} {:<8s}{:>10s}{:>10s}{:>10s} {:<7s}{:>3s}  {:<8s}{:>10s}\n'.format(
+                        parts[0], parts[1], parts[2], parts[3], parts[4],
+                        parts[5], parts[6], parts[7],
+                        parts[8] if len(parts) > 8 else '0.0000'))
+                continue
+        out_lines.append(line)
+
+    with open(output_mol2, 'w') as f:
+        f.writelines(out_lines)
+
+
 # Common cofactors + metal ions that should be kept as part of the receptor.
 # Drug-like HETATMs are stripped by default.
 DEFAULT_KEEP_HETATMS = frozenset([
@@ -278,24 +331,29 @@ def prepare(protein_pdb: str, ligands_file: str,
     ligand_stem = Path(ligands_file).stem
     prepared_mol2 = str(target_dir / f"{ligand_stem}.mol2")
 
-    # 3a. BRICS on raw input (SDF -> mol2 first if needed)
+    # 3a. Convert to mol2 if needed and canonicalize atom names (unique per-element).
+    #     Both the BRICS input and the final inference mol2 go through the same
+    #     canonicalization -- keyatom names then match by construction.
     input_suffix = Path(ligands_file).suffix.lower()
     if input_suffix == '.sdf':
-        # Cheap raw SDF -> mol2 (no H addition, no charge assignment)
-        raw_mol2_for_brics = str(target_dir / f"{ligand_stem}_raw.mol2")
+        raw_mol2 = str(target_dir / f"{ligand_stem}_raw.mol2")
         result = subprocess.run(
-            ['obabel', '-isdf', ligands_file, '-omol2', '-O', raw_mol2_for_brics],
+            ['obabel', '-isdf', ligands_file, '-omol2', '-O', raw_mol2],
             capture_output=True, text=True)
-        if not _file_ok(raw_mol2_for_brics):
+        if not _file_ok(raw_mol2):
             logger.error(f"SDF -> mol2 for BRICS input failed: {result.stderr}")
             sys.exit(1)
     else:
-        raw_mol2_for_brics = ligands_file
+        raw_mol2 = ligands_file
 
+    canonical_input = str(target_dir / f"{ligand_stem}_canonical.mol2")
+    canonicalize_mol2_atom_names(raw_mol2, canonical_input)
+
+    # 3b. BRICS on the canonicalized input.
     keyatom_npz = str(target_dir / f"{ligand_stem}.keyatom.def.npz")
-    logger.info(f"Computing key atoms on raw input (BRICS, {workers} workers)...")
+    logger.info(f"Computing key atoms on canonical input (BRICS, {workers} workers)...")
     launch_batched_ligand(
-        raw_mol2_for_brics,
+        canonical_input,
         N=workers,
         collated_npz=keyatom_npz,
     )
@@ -303,18 +361,18 @@ def prepare(protein_pdb: str, ligands_file: str,
         logger.error("Key atom computation failed (no output)")
         sys.exit(1)
 
-    # 3b. Ligand prep for inference-ready mol2 (H addition + MMFF94 charges).
-    # Skipped if user provided --skip-ligand-prep or has USER_CHARGES already.
+    # 3c. Ligand prep for inference-ready mol2. Uses the canonicalized input
+    # so obabel preserves the same heavy-atom ordering; we re-canonicalize
+    # afterward to restore names in case obabel's -p 7 step stripped them.
     if skip_ligand_prep:
-        if input_suffix == '.mol2':
-            shutil.copy2(ligands_file, prepared_mol2)
-        else:
-            logger.error("--skip-ligand-prep requires mol2 input")
-            sys.exit(1)
-        logger.info(f"Copied ligand mol2 as-is -> {prepared_mol2}")
+        shutil.copy2(canonical_input, prepared_mol2)
+        logger.info(f"Copied canonicalized mol2 as-is -> {prepared_mol2}")
     else:
-        if not prepare_ligand_mol2(ligands_file, prepared_mol2):
+        tmp_prepared = str(target_dir / f"{ligand_stem}_obabel.mol2")
+        if not prepare_ligand_mol2(canonical_input, tmp_prepared):
             sys.exit(1)
+        canonicalize_mol2_atom_names(tmp_prepared, prepared_mol2)
+        os.remove(tmp_prepared)
 
     n_compounds = count_mol2_compounds(prepared_mol2)
     logger.info(f"  {n_compounds} compounds in {prepared_mol2}")
