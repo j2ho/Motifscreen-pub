@@ -356,30 +356,73 @@ class GeneralDataset:
             yield batch
 
     def iter_batches_threaded(self, target_id: str, batch_size: int, pool):
-        """Yield batches with threaded graph building (for multi-GPU)."""
-        from concurrent.futures import ThreadPoolExecutor
+        """Yield batches with parallel graph building via the passed thread pool.
 
+        Streams: graphs get built in worker threads while already-built batches
+        are being scored on the GPU. Prior implementation built ALL compounds
+        in one target before yielding, leaving GPUs idle for 5+ minutes per
+        large target (fatal on DUD-E/LIT-PCBA scale).
+        """
         target_dir = os.path.join(self.datapath, target_id)
         mol2_files = self.find_mol2_files(target_id, target_dir)
         batch_dir = os.path.join(target_dir, 'batch_mol2s')
         if os.path.isdir(batch_dir):
             mol2_files += self.find_mol2_files(target_id, batch_dir)
 
-        # Collect all raw molecule data first, then build graphs in parallel
         for mol2_path in mol2_files:
             keyatom_path = self.find_keyatom_file(target_id, target_dir, mol2_path)
             if keyatom_path is None:
                 continue
-            # Build graphs for this mol2 file (already parallelized inside load_mol2_compounds
-            # via numpy/scipy GIL release). For multi-GPU we yield in batch_size chunks.
-            compounds = self.load_mol2_compounds(mol2_path, keyatom_path)
-            for c in compounds:
-                c['source_mol2'] = Path(mol2_path).stem
 
-            for i in range(0, len(compounds), batch_size):
-                batch = compounds[i:i + batch_size]
-                if batch:
+            keyatoms_dict = self.loader.load_keyatoms(keyatom_path, targetname="")
+            mol_data = self.loader.read_mol2_batch(mol2_path, tags=None)
+            if mol_data is None:
+                continue
+            elems, qs, bonds, borders, xyz, nneighs, atms, atypes, tags = mol_data
+            source = Path(mol2_path).stem
+
+            def _build(args):
+                elem, q, bond, border, coord, nneigh, atm, atype, tag = args
+                try:
+                    mol_tuple = (elem, q, bond, border, coord, nneigh, atype)
+                    graph = self.graph_builder.build_ligand_graph(mol_tuple, name=tag)
+                    if graph is None:
+                        return None
+                    com = torch.mean(graph.ndata['x'], axis=0).float()
+                    graph.ndata['x'] = (graph.ndata['x'] - com).float()
+                    filtered = ([a for a, e in zip(atm, elem) if e != 'H']
+                                if self.model_config.processing.drop_H else atm)
+                    key_indices, key_atom_names = self._get_key_indices(
+                        tag, filtered, keyatoms_dict)
+                    if not key_indices:
+                        return None
+                    return {
+                        'compound_id': tag,
+                        'graph': graph,
+                        'key_indices': key_indices,
+                        'key_atom_names': key_atom_names,
+                        'key_atom_orig_xyz': graph.ndata['x'][key_indices].cpu().numpy(),
+                        'source_mol2': source,
+                    }
+                except Exception:
+                    return None
+
+            # Submit all graph builds to the pool, drain in submission order so
+            # batches leave in mol2 file order (deterministic scoring output).
+            items = list(zip(elems, qs, bonds, borders, xyz, nneighs, atms, atypes, tags))
+            futures = [pool.submit(_build, it) for it in items]
+
+            batch = []
+            for fut in futures:
+                result = fut.result()
+                if result is None:
+                    continue
+                batch.append(result)
+                if len(batch) >= batch_size:
                     yield batch
+                    batch = []
+            if batch:
+                yield batch
 
 
 def load_model(checkpoint: str, config: Config, device: torch.device) -> torch.nn.Module:
