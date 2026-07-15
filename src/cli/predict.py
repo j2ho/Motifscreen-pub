@@ -27,7 +27,7 @@ import os
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, Future
+from concurrent.futures import ThreadPoolExecutor, Future
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -39,8 +39,6 @@ from scripts.inference.run_inference_general import (
     TimingStats,
     load_model,
     prepare_batch,
-    _init_predict_worker,
-    _noop_warmup,
 )
 from configs.config_loader import load_config, Config
 
@@ -324,33 +322,11 @@ def main():
 
     if use_multigpu:
         logger.info(f"Multi-GPU: {gpu_ids}")
-
-        # Create ProcessPool BEFORE loading any CUDA state. Workers spawned
-        # after cuInit() inherit a broken CUDA context via fork; even with
-        # spawn context the parent's ~30GB memory footprint per worker
-        # creates OS pressure. Fork-first with a clean parent stays lean.
-        # Use 'spawn' anyway so workers explicitly re-import without state.
-        import multiprocessing as mp
-        ctx = mp.get_context('spawn')
-        gb_args = (
-            model_config.graph,
-            model_config.augmentation,
-            model_config.processing,
-            True,  # static=True
-        )
-        build_pool = ProcessPoolExecutor(
-            max_workers=args.num_workers,
-            mp_context=ctx,
-            initializer=_init_predict_worker,
-            initargs=(gb_args,),
-        )
-        # Warm the pool: submit a no-op to force worker startup so the first
-        # real target doesn't pay initialization cost.
-        _ = list(build_pool.map(_noop_warmup, range(args.num_workers)))
-        logger.info(f"ProcessPool ready ({args.num_workers} workers)")
-
-        # NOW load model to GPU (workers already spawned; won't inherit CUDA state)
         runner = MultiGPURunner(args.checkpoint, model_config, gpu_ids)
+        # Threads for parallel build (GIL releases inside RDKit/DGL C ops give
+        # real overlap with GPU compute). ProcessPool was tried but IPC pickle
+        # costs on ~30k DGL graphs dominated the parallelism gain.
+        build_pool = ThreadPoolExecutor(max_workers=args.num_workers)
         gpu_pool = ThreadPoolExecutor(max_workers=len(gpu_ids))
         try:
             all_dfs = []
