@@ -27,7 +27,7 @@ import os
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, Future
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, Future
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -39,6 +39,7 @@ from scripts.inference.run_inference_general import (
     TimingStats,
     load_model,
     prepare_batch,
+    _init_predict_worker,
 )
 from configs.config_loader import load_config, Config
 
@@ -204,8 +205,12 @@ class MultiGPURunner:
 
 def run_target_multigpu(runner: MultiGPURunner, dataset: GeneralDataset,
                         target_id: str, batch_size: int,
-                        n_workers: int) -> Optional[pd.DataFrame]:
-    """Run inference on one target across multiple GPUs."""
+                        build_pool, gpu_pool) -> Optional[pd.DataFrame]:
+    """Run inference on one target across multiple GPUs.
+
+    build_pool and gpu_pool are long-lived pools created in main() so that
+    process startup happens once, not once per target.
+    """
     receptor = dataset.load_receptor(target_id)
     if receptor is None:
         return None
@@ -218,26 +223,24 @@ def run_target_multigpu(runner: MultiGPURunner, dataset: GeneralDataset,
     batch_count = 0
     compound_count = 0
 
-    with ThreadPoolExecutor(max_workers=n_workers) as build_pool, \
-         ThreadPoolExecutor(max_workers=len(runner.gpu_ids)) as gpu_pool:
-        gpu_futures: List[Future] = []
+    gpu_futures: List[Future] = []
 
-        for batch in dataset.iter_batches_threaded(target_id, batch_size, build_pool):
-            if not batch:
-                continue
+    for batch in dataset.iter_batches_threaded(target_id, batch_size, build_pool):
+        if not batch:
+            continue
 
-            batch_count += 1
-            compound_count += len(batch)
+        batch_count += 1
+        compound_count += len(batch)
 
-            gpu_id = next(gpu_cycle)
-            future = gpu_pool.submit(runner.run_batch, gpu_id, batch)
-            gpu_futures.append(future)
+        gpu_id = next(gpu_cycle)
+        future = gpu_pool.submit(runner.run_batch, gpu_id, batch)
+        gpu_futures.append(future)
 
-            if batch_count % 50 == 0:
-                logger.info(f"  [{target_id}] Batch {batch_count}: {compound_count} compounds")
+        if batch_count % 50 == 0:
+            logger.info(f"  [{target_id}] Batch {batch_count}: {compound_count} compounds")
 
-        for future in gpu_futures:
-            results.extend(future.result())
+    for future in gpu_futures:
+        results.extend(future.result())
 
     if not results:
         return None
@@ -321,14 +324,34 @@ def main():
     if use_multigpu:
         logger.info(f"Multi-GPU: {gpu_ids}")
         runner = MultiGPURunner(args.checkpoint, model_config, gpu_ids)
-        all_dfs = []
-        for target_id in targets:
-            df = run_target_multigpu(
-                runner, dataset, target_id, args.batch_size, args.num_workers
-            )
-            if df is not None:
-                df['target_id'] = target_id
-                all_dfs.append(df)
+
+        # ProcessPool for CPU-bound ligand graph building (bypasses GIL).
+        # Passed graph-builder config gets rebuilt inside each worker.
+        gb_args = (
+            model_config.graph,
+            model_config.augmentation,
+            model_config.processing,
+            True,  # static=True
+        )
+        build_pool = ProcessPoolExecutor(
+            max_workers=args.num_workers,
+            initializer=_init_predict_worker,
+            initargs=(gb_args,),
+        )
+        gpu_pool = ThreadPoolExecutor(max_workers=len(gpu_ids))
+        try:
+            all_dfs = []
+            for target_id in targets:
+                df = run_target_multigpu(
+                    runner, dataset, target_id, args.batch_size,
+                    build_pool, gpu_pool,
+                )
+                if df is not None:
+                    df['target_id'] = target_id
+                    all_dfs.append(df)
+        finally:
+            build_pool.shutdown(wait=True)
+            gpu_pool.shutdown(wait=True)
     else:
         device = torch.device(f'cuda:{gpu_ids[0]}' if gpu_ids else 'cpu')
         logger.info(f"Single device: {device}")

@@ -127,6 +127,62 @@ class TimingStats:
         print("=" * 70 + "\n")
 
 
+# ---------------------------------------------------------------------------
+# ProcessPool worker for parallel ligand graph building
+# ---------------------------------------------------------------------------
+# Workers hold a GraphBuilder in module-level state. Initialized once per
+# worker via ProcessPoolExecutor(initializer=_init_predict_worker, ...).
+
+_worker_state = {}
+
+
+def _init_predict_worker(graph_builder_args):
+    """Initialize a graph builder in each worker process."""
+    config_graph, config_augmentation, config_processing, static = graph_builder_args
+    _worker_state['gb'] = GraphBuilder(
+        config_graph=config_graph,
+        config_augmentation=config_augmentation,
+        config_processing=config_processing,
+        static=static,
+    )
+
+
+def _build_compound(args):
+    """Build DGL ligand graph + collect key atom indices. Runs in worker."""
+    (elem, q, bond, border, coord, nneigh, atm, atype, tag,
+     ka_names, drop_H, source) = args
+    try:
+        if not ka_names:
+            return None
+        gb = _worker_state['gb']
+        mol_tuple = (elem, q, bond, border, coord, nneigh, atype)
+        graph = gb.build_ligand_graph(mol_tuple, name=tag)
+        if graph is None:
+            return None
+        com = torch.mean(graph.ndata['x'], axis=0).float()
+        graph.ndata['x'] = (graph.ndata['x'] - com).float()
+        filtered = ([a for a, e in zip(atm, elem) if e != 'H']
+                    if drop_H else atm)
+        key_atom_names = [a for a in ka_names if a in filtered]
+        if not key_atom_names:
+            return None
+        indices = [filtered.index(a) for a in key_atom_names]
+        if len(indices) > 10:
+            selected = np.random.choice(len(indices), 10, replace=False)
+            indices = [indices[i] for i in selected]
+            key_atom_names = [key_atom_names[i] for i in selected]
+        return {
+            'compound_id': tag,
+            'graph': graph,
+            'key_indices': indices,
+            'key_atom_names': key_atom_names,
+            'key_atom_orig_xyz': graph.ndata['x'][indices].cpu().numpy(),
+            'source_mol2': source,
+        }
+    except Exception:
+        return None
+
+
 @dataclass
 class InferenceConfig:
     """Configuration for general inference"""
@@ -356,18 +412,22 @@ class GeneralDataset:
             yield batch
 
     def iter_batches_threaded(self, target_id: str, batch_size: int, pool):
-        """Yield batches with parallel graph building via the passed thread pool.
+        """Yield batches with parallel graph building via a shared ProcessPool.
 
-        Streams: graphs get built in worker threads while already-built batches
-        are being scored on the GPU. Prior implementation built ALL compounds
-        in one target before yielding, leaving GPUs idle for 5+ minutes per
-        large target (fatal on DUD-E/LIT-PCBA scale).
+        The ``pool`` argument is accepted for API compatibility with the older
+        ThreadPoolExecutor signature. Under the hood we use whatever pool the
+        caller passes as long as it exposes ``submit``. For the new predict
+        flow, a process pool is passed in from ``main()`` so that CPU-bound
+        graph building parallelizes across cores (threads are GIL-bound and
+        gave ~30-50% GPU util on large DUD-E/LIT-PCBA targets).
         """
         target_dir = os.path.join(self.datapath, target_id)
         mol2_files = self.find_mol2_files(target_id, target_dir)
         batch_dir = os.path.join(target_dir, 'batch_mol2s')
         if os.path.isdir(batch_dir):
             mol2_files += self.find_mol2_files(target_id, batch_dir)
+
+        drop_H = self.model_config.processing.drop_H
 
         for mol2_path in mol2_files:
             keyatom_path = self.find_keyatom_file(target_id, target_dir, mol2_path)
@@ -381,36 +441,16 @@ class GeneralDataset:
             elems, qs, bonds, borders, xyz, nneighs, atms, atypes, tags = mol_data
             source = Path(mol2_path).stem
 
-            def _build(args):
-                elem, q, bond, border, coord, nneigh, atm, atype, tag = args
-                try:
-                    mol_tuple = (elem, q, bond, border, coord, nneigh, atype)
-                    graph = self.graph_builder.build_ligand_graph(mol_tuple, name=tag)
-                    if graph is None:
-                        return None
-                    com = torch.mean(graph.ndata['x'], axis=0).float()
-                    graph.ndata['x'] = (graph.ndata['x'] - com).float()
-                    filtered = ([a for a, e in zip(atm, elem) if e != 'H']
-                                if self.model_config.processing.drop_H else atm)
-                    key_indices, key_atom_names = self._get_key_indices(
-                        tag, filtered, keyatoms_dict)
-                    if not key_indices:
-                        return None
-                    return {
-                        'compound_id': tag,
-                        'graph': graph,
-                        'key_indices': key_indices,
-                        'key_atom_names': key_atom_names,
-                        'key_atom_orig_xyz': graph.ndata['x'][key_indices].cpu().numpy(),
-                        'source_mol2': source,
-                    }
-                except Exception:
-                    return None
+            # Build per-compound arg tuples. Only send picklable data - the
+            # graph_builder + config are already primed inside workers via
+            # ProcessPool initializer (see _init_predict_worker below).
+            items = []
+            for elem, q, bond, border, coord, nneigh, atm, atype, tag in zip(
+                    elems, qs, bonds, borders, xyz, nneighs, atms, atypes, tags):
+                items.append((elem, q, bond, border, coord, nneigh, atm, atype, tag,
+                              keyatoms_dict.get(tag), drop_H, source))
 
-            # Submit all graph builds to the pool, drain in submission order so
-            # batches leave in mol2 file order (deterministic scoring output).
-            items = list(zip(elems, qs, bonds, borders, xyz, nneighs, atms, atypes, tags))
-            futures = [pool.submit(_build, it) for it in items]
+            futures = [pool.submit(_build_compound, it) for it in items]
 
             batch = []
             for fut in futures:
