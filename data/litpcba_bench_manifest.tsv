@@ -1,0 +1,14 @@
+target_id	pdb	center_x	center_y	center_z	n_actives	n_decoys
+ADRB2	3p0g_protein.pdb	64.542	16.618	12.612	17	311640
+ALDH1	4wp7_protein.pdb	38.254	-17.012	14.033	5363	101790
+ESR1_ago	1l2i_protein.pdb	5.478	-0.046	-5.547	13	4369
+ESR1_ant	1xp1_protein.pdb	31.453	-1.848	24.226	88	3814
+GBA	2v3d_protein.pdb	33.315	34.772	-19.557	163	291101
+IDH1	4i3k_protein.pdb	37.237	-12.841	-13.525	39	358632
+MAPK1	1pme_protein.pdb	-12.775	13.280	40.855	307	61481
+MTORC1	1fap_protein.pdb	-8.779	26.976	36.485	97	32972
+OPRK1	6b73_protein.pdb	60.510	-24.667	-4.445	24	269406
+PKM2	3gqy_protein.pdb	18.748	-12.471	30.672	546	244614
+PPARG	1zgy_protein.pdb	30.195	1.673	27.238	24	4065
+TP53	2vuk_protein.pdb	124.684	105.416	-42.829	64	3339
+VDR	3a2i_protein.pdb	11.725	-3.202	-32.024	650	262514
