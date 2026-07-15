@@ -261,6 +261,142 @@ def _launch_batched_pdb_legacy(pdb_file, N, collated_npz):
             pass
 
 
+## -- Precompute DGL ligand graphs (Tier 3 perf) --
+
+_graph_worker_state = {}
+
+
+def _init_graph_worker(gb_args):
+    """Init per-worker GraphBuilder for parallel graph building.
+
+    gb_args is a picklable tuple. GraphBuilder is instantiated inside each
+    worker; config dataclasses pickle fine.
+    """
+    from src.data.dataset_jiho import GraphBuilder
+    config_graph, config_augmentation, config_processing, static = gb_args
+    _graph_worker_state['gb'] = GraphBuilder(
+        config_graph=config_graph,
+        config_augmentation=config_augmentation,
+        config_processing=config_processing,
+        static=static,
+    )
+
+
+def _graph_worker(args):
+    """Build DGL ligand graph for one compound. Returns dict or None."""
+    import torch
+    (elems, qs, bonds, borders, xyz, nneighs, atms, atypes,
+     ka_names, drop_H, tag) = args
+    try:
+        if not ka_names:
+            return None
+        gb = _graph_worker_state['gb']
+        mol_tuple = (elems, qs, bonds, borders, xyz, nneighs, atypes)
+        graph = gb.build_ligand_graph(mol_tuple, name=tag)
+        if graph is None:
+            return None
+        com = torch.mean(graph.ndata['x'], axis=0).float()
+        graph.ndata['x'] = (graph.ndata['x'] - com).float()
+        # IMPORTANT: .copy() to break the memory view. Torch->numpy views can
+        # become stale after the source tensor is GC'd in the worker.
+        gdata_np = graph.gdata.detach().cpu().numpy().copy()
+        filtered = [a for a, e in zip(atms, elems) if e != 'H'] if drop_H else atms
+        ka_in_mol = [a for a in ka_names if a in filtered]
+        if not ka_in_mol:
+            return None
+        indices = [filtered.index(a) for a in ka_in_mol]
+        if len(indices) > 10:
+            selected = np.random.choice(len(indices), 10, replace=False)
+            indices = [indices[i] for i in selected]
+            ka_in_mol = [ka_in_mol[i] for i in selected]
+        return {
+            'tag': tag,
+            'graph': graph,
+            'gdata': gdata_np,
+            'key_indices': indices,
+            'key_atom_names': ka_in_mol,
+            'key_atom_orig_xyz': graph.ndata['x'][indices].detach().cpu().numpy().copy(),
+        }
+    except Exception:
+        return None
+
+
+def build_ligand_graphs_batch(mol2_path, keyatom_npz, out_prefix, config, N=8):
+    """Precompute DGL ligand graphs + metadata from an already-prepped mol2.
+
+    Reads existing keyatom.def.npz (from launch_batched_ligand) and builds
+    DGL graphs in parallel worker processes. Writes:
+
+      <out_prefix>.graphs.bin      dgl.save_graphs output for N compounds
+      <out_prefix>.graphs.meta.npz per-graph metadata:
+        - tags (N,)             compound_id per graph
+        - gdata (N, 19)         global features per graph
+        - key_indices (N,)      list per graph, filtered-atom indices
+        - key_atom_names (N,)   list per graph, atom names
+        - key_atom_orig_xyz (N,) list per graph, centered coords
+
+    The graphs.bin + meta.npz pair lets predict skip all CPU featurization.
+    """
+    import dgl
+    if not os.path.exists(keyatom_npz):
+        raise RuntimeError(f"keyatom.def.npz not found: {keyatom_npz}")
+
+    keyatoms_dict = np.load(keyatom_npz, allow_pickle=True)['keyatms'].item()
+
+    # Parse mol2 once via the standard loader
+    from src.data.dataset_jiho import MolecularLoader
+    loader = MolecularLoader(config.paths, config.processing, config.augmentation)
+    mol_data = loader.read_mol2_batch(mol2_path, tags=None)
+    if mol_data is None:
+        raise RuntimeError(f"Failed to read {mol2_path}")
+    elems_l, qs_l, bonds_l, borders_l, xyz_l, nneighs_l, atms_l, atypes_l, tags_l = mol_data
+    drop_H = config.processing.drop_H
+
+    args_list = []
+    for i, tag in enumerate(tags_l):
+        args_list.append((
+            elems_l[i], qs_l[i], bonds_l[i], borders_l[i], xyz_l[i],
+            nneighs_l[i], atms_l[i], atypes_l[i],
+            keyatoms_dict.get(tag), drop_H, tag,
+        ))
+
+    gb_args = (config.graph, config.augmentation, config.processing, True)
+
+    if N > 1:
+        with mp.Pool(processes=N, initializer=_init_graph_worker,
+                     initargs=(gb_args,)) as pool:
+            results = pool.map(_graph_worker, args_list)
+    else:
+        _init_graph_worker(gb_args)
+        results = [_graph_worker(a) for a in args_list]
+
+    graphs, tags_out, gdatas, key_indices, key_atom_names, key_atom_orig_xyz = \
+        [], [], [], [], [], []
+    for r in results:
+        if r is None:
+            continue
+        graphs.append(r['graph'])
+        tags_out.append(r['tag'])
+        gdatas.append(r['gdata'])
+        key_indices.append(r['key_indices'])
+        key_atom_names.append(r['key_atom_names'])
+        key_atom_orig_xyz.append(r['key_atom_orig_xyz'])
+
+    if not graphs:
+        raise RuntimeError(f"No graphs built for {mol2_path}")
+
+    dgl.save_graphs(f"{out_prefix}.graphs.bin", graphs)
+    np.savez(
+        f"{out_prefix}.graphs.meta.npz",
+        tags=np.array(tags_out, dtype=object),
+        gdata=np.stack(gdatas, axis=0),
+        key_indices=np.array(key_indices, dtype=object),
+        key_atom_names=np.array(key_atom_names, dtype=object),
+        key_atom_orig_xyz=np.array(key_atom_orig_xyz, dtype=object),
+    )
+    return len(graphs)
+
+
 if __name__ == "__main__":
     import sys
     lig_file = sys.argv[1] if len(sys.argv) > 1 else "data/example/ligand.mol2"
