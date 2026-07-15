@@ -40,6 +40,7 @@ from scripts.inference.run_inference_general import (
     load_model,
     prepare_batch,
     _init_predict_worker,
+    _noop_warmup,
 )
 from configs.config_loader import load_config, Config
 
@@ -323,10 +324,14 @@ def main():
 
     if use_multigpu:
         logger.info(f"Multi-GPU: {gpu_ids}")
-        runner = MultiGPURunner(args.checkpoint, model_config, gpu_ids)
 
-        # ProcessPool for CPU-bound ligand graph building (bypasses GIL).
-        # Passed graph-builder config gets rebuilt inside each worker.
+        # Create ProcessPool BEFORE loading any CUDA state. Workers spawned
+        # after cuInit() inherit a broken CUDA context via fork; even with
+        # spawn context the parent's ~30GB memory footprint per worker
+        # creates OS pressure. Fork-first with a clean parent stays lean.
+        # Use 'spawn' anyway so workers explicitly re-import without state.
+        import multiprocessing as mp
+        ctx = mp.get_context('spawn')
         gb_args = (
             model_config.graph,
             model_config.augmentation,
@@ -335,9 +340,17 @@ def main():
         )
         build_pool = ProcessPoolExecutor(
             max_workers=args.num_workers,
+            mp_context=ctx,
             initializer=_init_predict_worker,
             initargs=(gb_args,),
         )
+        # Warm the pool: submit a no-op to force worker startup so the first
+        # real target doesn't pay initialization cost.
+        _ = list(build_pool.map(_noop_warmup, range(args.num_workers)))
+        logger.info(f"ProcessPool ready ({args.num_workers} workers)")
+
+        # NOW load model to GPU (workers already spawned; won't inherit CUDA state)
+        runner = MultiGPURunner(args.checkpoint, model_config, gpu_ids)
         gpu_pool = ThreadPoolExecutor(max_workers=len(gpu_ids))
         try:
             all_dfs = []

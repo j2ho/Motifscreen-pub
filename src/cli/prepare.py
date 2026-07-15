@@ -47,7 +47,7 @@ sys.path.insert(0, str(project_root))
 
 from src.io.protein_featurizer import main as featurize_protein
 from src.io.protein_featurizer import calculate_ligand_com
-from src.io.ligand_processer import launch_batched_ligand
+from src.io.ligand_processer import launch_batched_ligand, build_ligand_graphs_batch
 
 logging.basicConfig(
     level=logging.INFO,
@@ -270,7 +270,8 @@ def prepare(protein_pdb: str, ligands_file: str,
             gridsize: float = 1.5,
             padding: float = 10.0,
             clash: float = 1.1,
-            keep_hetatms: list = None):
+            keep_hetatms: list = None,
+            precompute_graphs: bool = False):
     """Run full preparation pipeline."""
 
     if target_id is None:
@@ -377,6 +378,27 @@ def prepare(protein_pdb: str, ligands_file: str,
     n_compounds = count_mol2_compounds(prepared_mol2)
     logger.info(f"  {n_compounds} compounds in {prepared_mol2}")
 
+    # 3d. Optional: precompute DGL ligand graphs so predict can skip all CPU
+    # featurization. Only worth doing if the same prepared dir will be scored
+    # against multiple checkpoints or multi-GPU predict is CPU-bound. Adds
+    # ~60-90 sec/target at prep time; saves ~15-25 sec per predict pass.
+    if precompute_graphs:
+        try:
+            from configs.config_loader import load_config as _load_cfg
+            _cfg_path = str(Path(__file__).resolve().parent.parent.parent /
+                            "configs" / "training" / "endtoend.yaml")
+            graph_config = _load_cfg(_cfg_path)
+            graphs_out_prefix = str(target_dir / ligand_stem)
+            logger.info(f"Precomputing DGL ligand graphs ({workers} workers)...")
+            n_graphs = build_ligand_graphs_batch(
+                prepared_mol2, keyatom_npz, graphs_out_prefix,
+                config=graph_config, N=workers,
+            )
+            logger.info(f"  -> {graphs_out_prefix}.graphs.bin ({n_graphs} graphs)")
+        except Exception as e:
+            logger.warning(f"Graph precomputation failed ({e}); predict will fall "
+                           f"back to on-the-fly featurization")
+
     # Verify keyatom coverage
     data = np.load(keyatom_npz, allow_pickle=True)
     keyatms = data['keyatms'].item()
@@ -439,6 +461,12 @@ def main():
                         help='Comma-separated extra HETATM residue names to keep '
                              '(e.g. "MYR,SUC"). Metals and standard cofactors are '
                              'kept automatically.')
+    parser.add_argument('--precompute-graphs', action='store_true',
+                        help='Also save DGL ligand graphs to <stem>.graphs.bin so '
+                             'predict skips CPU featurization. Adds ~60-90s/target '
+                             'to prep; saves ~15-25s per predict pass. Worth it '
+                             'when scoring the same library against multiple '
+                             'checkpoints or if predict is CPU-bound.')
 
     args = parser.parse_args()
 
@@ -479,6 +507,7 @@ def main():
         padding=args.padding,
         clash=args.clash,
         keep_hetatms=keep_hetatms,
+        precompute_graphs=args.precompute_graphs,
     )
 
 

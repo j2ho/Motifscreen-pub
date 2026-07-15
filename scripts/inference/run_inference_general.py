@@ -147,8 +147,17 @@ def _init_predict_worker(graph_builder_args):
     )
 
 
+def _noop_warmup(_):
+    """Force worker process to fully spawn + init before any real work lands."""
+    return _worker_state.get('gb') is not None
+
+
 def _build_compound(args):
-    """Build DGL ligand graph + collect key atom indices. Runs in worker."""
+    """Build one DGL ligand graph. Kept for backwards compat / small runs."""
+    return _build_compound_impl(args)
+
+
+def _build_compound_impl(args):
     (elem, q, bond, border, coord, nneigh, atm, atype, tag,
      ka_names, drop_H, source) = args
     try:
@@ -181,6 +190,16 @@ def _build_compound(args):
         }
     except Exception:
         return None
+
+
+def _build_compound_chunk(chunk_args):
+    """Build a chunk of ligand graphs. Amortizes IPC over many compounds.
+
+    Trades per-compound submit overhead for per-chunk pickle cost. On a 30k
+    compound target with 8 workers, submitting 30k tasks costs seconds in
+    pickling; submitting 8 chunks of 3750 costs milliseconds.
+    """
+    return [_build_compound_impl(a) for a in chunk_args]
 
 
 @dataclass
@@ -387,8 +406,66 @@ class GeneralDataset:
             key_atom_names = [key_atom_names[i] for i in selected]
         return indices, key_atom_names
 
+    def _find_precomputed_graph_files(self, target_id: str) -> List[Tuple[str, str]]:
+        """Find (graphs.bin, graphs.meta.npz) pairs in the target dir.
+
+        Returns list of (bin_path, meta_path) for each mol2 that has both.
+        """
+        target_dir = os.path.join(self.datapath, target_id)
+        pairs = []
+        for f in sorted(os.listdir(target_dir)):
+            if f.endswith('.graphs.bin'):
+                stem = f[:-len('.graphs.bin')]
+                bin_path = os.path.join(target_dir, f)
+                meta_path = os.path.join(target_dir, f'{stem}.graphs.meta.npz')
+                if os.path.exists(meta_path):
+                    pairs.append((bin_path, meta_path))
+        return pairs
+
+    def load_precomputed_compounds(self, bin_path: str, meta_path: str) -> List[Dict]:
+        """Load precomputed DGL graphs + metadata. Zero CPU featurization."""
+        import dgl
+        graphs, _ = dgl.load_graphs(bin_path)
+        meta = np.load(meta_path, allow_pickle=True)
+        tags = meta['tags']
+        gdata = meta['gdata']  # (N, 19)
+        key_indices = meta['key_indices']
+        key_atom_names = meta['key_atom_names']
+        key_atom_orig_xyz = meta['key_atom_orig_xyz']
+        source = Path(bin_path).stem.replace('.graphs', '')
+        out = []
+        for i, g in enumerate(graphs):
+            # Reattach gdata that dgl.save_graphs doesn't preserve
+            setattr(g, 'gdata', torch.tensor(gdata[i]).float())
+            out.append({
+                'compound_id': str(tags[i]),
+                'graph': g,
+                'key_indices': list(key_indices[i]),
+                'key_atom_names': list(key_atom_names[i]),
+                'key_atom_orig_xyz': key_atom_orig_xyz[i],
+                'source_mol2': source,
+            })
+        return out
+
     def iter_batches(self, target_id: str, batch_size: int):
-        """Yield batches of compounds for a target (single-threaded)."""
+        """Yield batches of compounds for a target (single-threaded).
+
+        Fast path: precomputed .graphs.bin (skips CPU featurization).
+        """
+        precomputed = self._find_precomputed_graph_files(target_id)
+        if precomputed:
+            for bin_path, meta_path in precomputed:
+                compounds = self.load_precomputed_compounds(bin_path, meta_path)
+                batch = []
+                for c in compounds:
+                    batch.append(c)
+                    if len(batch) >= batch_size:
+                        yield batch
+                        batch = []
+                if batch:
+                    yield batch
+            return
+
         target_dir = os.path.join(self.datapath, target_id)
         mol2_files = self.find_mol2_files(target_id, target_dir)
         # Also check batch_mol2s/ subdirectory
@@ -414,13 +491,25 @@ class GeneralDataset:
     def iter_batches_threaded(self, target_id: str, batch_size: int, pool):
         """Yield batches with parallel graph building via a shared ProcessPool.
 
-        The ``pool`` argument is accepted for API compatibility with the older
-        ThreadPoolExecutor signature. Under the hood we use whatever pool the
-        caller passes as long as it exposes ``submit``. For the new predict
-        flow, a process pool is passed in from ``main()`` so that CPU-bound
-        graph building parallelizes across cores (threads are GIL-bound and
-        gave ~30-50% GPU util on large DUD-E/LIT-PCBA targets).
+        Fast path: if <mol2_stem>.graphs.bin + .graphs.meta.npz exist for a
+        mol2 file, load precomputed graphs (zero CPU featurization).
+        Slow path: parse mol2 + build graphs in worker processes.
         """
+        # Fast path: precomputed graphs
+        precomputed = self._find_precomputed_graph_files(target_id)
+        if precomputed:
+            for bin_path, meta_path in precomputed:
+                compounds = self.load_precomputed_compounds(bin_path, meta_path)
+                batch = []
+                for c in compounds:
+                    batch.append(c)
+                    if len(batch) >= batch_size:
+                        yield batch
+                        batch = []
+                if batch:
+                    yield batch
+            return
+
         target_dir = os.path.join(self.datapath, target_id)
         mol2_files = self.find_mol2_files(target_id, target_dir)
         batch_dir = os.path.join(target_dir, 'batch_mol2s')
@@ -442,25 +531,33 @@ class GeneralDataset:
             source = Path(mol2_path).stem
 
             # Build per-compound arg tuples. Only send picklable data - the
-            # graph_builder + config are already primed inside workers via
-            # ProcessPool initializer (see _init_predict_worker below).
+            # graph_builder is primed inside workers via ProcessPool initializer.
             items = []
             for elem, q, bond, border, coord, nneigh, atm, atype, tag in zip(
                     elems, qs, bonds, borders, xyz, nneighs, atms, atypes, tags):
                 items.append((elem, q, bond, border, coord, nneigh, atm, atype, tag,
                               keyatoms_dict.get(tag), drop_H, source))
 
-            futures = [pool.submit(_build_compound, it) for it in items]
+            # Chunk compounds so per-worker IPC cost is amortized. Using
+            # ~4x n_workers chunks gives decent load balancing without too
+            # many chunks. batch_size stays as the eventual yield unit.
+            n_workers = getattr(pool, '_max_workers', 8)
+            n_chunks = max(1, min(n_workers * 4, max(1, len(items) // 100)))
+            chunk_size = max(1, (len(items) + n_chunks - 1) // n_chunks)
+            chunks = [items[i:i + chunk_size] for i in range(0, len(items), chunk_size)]
+
+            futures = [pool.submit(_build_compound_chunk, c) for c in chunks]
 
             batch = []
             for fut in futures:
-                result = fut.result()
-                if result is None:
-                    continue
-                batch.append(result)
-                if len(batch) >= batch_size:
-                    yield batch
-                    batch = []
+                results = fut.result()
+                for r in results:
+                    if r is None:
+                        continue
+                    batch.append(r)
+                    if len(batch) >= batch_size:
+                        yield batch
+                        batch = []
             if batch:
                 yield batch
 
