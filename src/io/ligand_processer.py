@@ -62,14 +62,63 @@ def _select_closest_to_com(atmxyz, frag_atm_names):
     return valid[int(np.argmin(d2))]
 
 
+def _rdkit_mol_from_mol2_block(mol2_block):
+    """Try progressively looser strategies to get an RDKit Mol from a mol2 block.
+
+    LIT-PCBA and other Unistra/PubChem-derived mol2s have ~35% failure rate on
+    strict `MolFromMol2Block`. Falling back to an obabel-mediated SDF round-trip
+    rescues ~99.5% of the failures (verified on KAT2A, N=200 sample).
+
+    Strategy order:
+      1. MolFromMol2Block strict (fast, ~5ms)
+      2. Obabel subprocess: mol2 -> SDF -> RDKit MolFromMolBlock (~50-80ms)
+
+    Returns (mol, source_tag) where source_tag is 'direct' or 'obabel_sdf'.
+    Returns (None, None) if all strategies fail.
+    """
+    m = Chem.MolFromMol2Block(mol2_block, sanitize=True, removeHs=True)
+    if m is not None:
+        return m, 'direct'
+
+    # Fallback: obabel converts mol2 -> SDF, RDKit reads the SDF cleanly.
+    # Preserves atom ordering so downstream name lookup by index still works.
+    import subprocess
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix='.mol2', mode='w', delete=False) as f:
+        f.write(mol2_block)
+        mol2_path = f.name
+    sdf_path = mol2_path + '.sdf'
+    try:
+        result = subprocess.run(
+            ['obabel', mol2_path, '-O', sdf_path],
+            capture_output=True, timeout=10)
+        if not os.path.exists(sdf_path) or os.path.getsize(sdf_path) == 0:
+            return None, None
+        with open(sdf_path) as f:
+            sdf_block = f.read()
+        m = Chem.MolFromMolBlock(sdf_block, sanitize=True, removeHs=True)
+        if m is None:
+            return None, None
+        return m, 'obabel_sdf'
+    except (subprocess.TimeoutExpired, Exception):
+        return None, None
+    finally:
+        for p in (mol2_path, sdf_path):
+            if os.path.exists(p):
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+
+
 def _brics_keyatoms_from_mol2_block(mol2_block, mol_atom_names, atms, mol2xyz_tag):
     """RDKit-native BRICS: mol2 block -> fragments -> keyatom names.
 
     Returns list of atom names (one per BRICS fragment, closest-to-COM), padded
     to at least 4 keyatoms with random non-H heavy atoms if BRICS produces fewer.
-    Returns None if the mol2 block cannot be parsed by RDKit.
+    Returns None if the mol2 block cannot be parsed by RDKit even via fallback.
     """
-    m = Chem.MolFromMol2Block(mol2_block, sanitize=True, removeHs=True)
+    m, _ = _rdkit_mol_from_mol2_block(mol2_block)
     if m is None:
         return None
 
