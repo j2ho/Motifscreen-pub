@@ -18,7 +18,7 @@ differ per benchmark.
 |---|---|---|---|---|---|
 | ChEMBL-LR-107 | 107 | ~200k | ~15 min | ~30 min | ~45 min |
 | DUD-E | 96 | ~1.5M | ~15-30 min | ~2 h | ~2.5 h |
-| LIT-PCBA | 13 | ~2M | ~15-25 min | ~2.5 h | ~3 h |
+| LIT-PCBA | 14 | ~2.3M | ~20-30 min | ~3 h | ~3.5 h |
 
 Prep time is amortized across `--parallel N` concurrent targets. Predict is
 GPU-bound; scales with GPU count.
@@ -66,11 +66,13 @@ bash scripts/run_dude_bench.sh \
 Output: per-target AUROC/EF@1%/BEDROC, comparable to numbers from Chen et al.
 2019, Ragoza et al. 2017, etc. See `docs/dude_targets.md` for the target list.
 
-## LIT-PCBA-13 (external)
+## LIT-PCBA-14 (external)
 
 Source: https://drugdesign.unistra.fr/LIT-PCBA/. We ship
-`data/litpcba_bench_manifest.tsv`. Full benchmark has 15 targets; we run 13
-(FEN1 and KAT2A excluded due to incomplete raw data / missing crystal ligand).
+`data/litpcba_bench_manifest.tsv`. Full benchmark has 15 targets; we run 14.
+FEN1 is excluded because its LIT-PCBA-supplied mol2 conversion is incomplete
+(no combined actives mol2 in the redistribution). All other 14 targets have
+complete raw data.
 
 ```bash
 # Download LIT-PCBA once (~40 GB, ~1 h)

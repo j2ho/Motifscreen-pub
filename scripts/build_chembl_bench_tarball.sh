@@ -7,7 +7,7 @@
 #
 # Usage:
 #   bash scripts/build_chembl_bench_tarball.sh \
-#       --source /home/j2ho/DB/motifscreen_a/chembl \
+#       --input-dir /home/j2ho/DB/motifscreen_a/chembl \
 #       --out chembl_bench_v1.tar.gz
 #
 # Expected structure of the source dir (per target):
@@ -39,7 +39,7 @@ STAGING=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --source) SOURCE="$2"; shift 2 ;;
+        --input-dir) SOURCE="$2"; shift 2 ;;
         --out) OUT="$2"; shift 2 ;;
         --manifest) MANIFEST="$2"; shift 2 ;;
         --staging) STAGING="$2"; shift 2 ;;
@@ -48,7 +48,7 @@ while [ $# -gt 0 ]; do
 done
 
 if [ -z "$SOURCE" ] || [ -z "$OUT" ]; then
-    echo "Usage: $0 --source <chembl_dir> --out <chembl_bench_v1.tar.gz>"
+    echo "Usage: $0 --input-dir <chembl_dir> --out <chembl_bench_v1.tar.gz>"
     exit 2
 fi
 
