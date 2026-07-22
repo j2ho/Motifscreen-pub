@@ -444,6 +444,19 @@ def prepare(protein_pdb: str, ligands_file: str,
         canonicalize_mol2_atom_names(tmp_prepared, prepared_mol2)
         os.remove(tmp_prepared)
 
+    # Clean up per-target mol2 intermediates. They're only used mid-pipeline;
+    # keeping them around causes predict's default `*.mol2` glob to score
+    # every compound twice (or more).
+    intermediates_to_clean = [canonical_input]
+    if input_suffix == '.sdf':
+        intermediates_to_clean.append(raw_mol2)
+    for p in intermediates_to_clean:
+        if os.path.exists(p) and os.path.abspath(p) != os.path.abspath(prepared_mol2):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
     n_compounds = count_mol2_compounds(prepared_mol2)
     logger.info(f"  {n_compounds} compounds in {prepared_mol2}")
 
