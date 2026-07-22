@@ -331,6 +331,13 @@ class GeneralDataset:
         2. Target root: {mol2_stem}.keyatom.def.npz
         3. Same directory as mol2: {target_id}.keyatom.def.npz (shared)
         4. Target root: {target_id}.keyatom.def.npz (shared)
+        5. Target root: all_ligands.keyatom.def.npz (canonical prepare output)
+        6. Same directory as mol2: all_ligands.keyatom.def.npz
+
+        The last two entries handle the common layout where prepare wrote a
+        single per-target keyatom dict named all_ligands.keyatom.def.npz and
+        the user later chunked all_ligands.mol2 into batch_mol2s/chunk_NNN.mol2
+        for scalable predict.
         """
         mol2_stem = Path(mol2_path).stem
         mol2_dir = str(Path(mol2_path).parent)
@@ -340,6 +347,11 @@ class GeneralDataset:
                 path = os.path.join(directory, name)
                 if os.path.exists(path):
                     return path
+
+        for directory in (target_dir, mol2_dir):
+            path = os.path.join(directory, "all_ligands.keyatom.def.npz")
+            if os.path.exists(path):
+                return path
 
         return None
 
