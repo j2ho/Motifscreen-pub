@@ -42,6 +42,7 @@ project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
 
 from src.data.dataset_jiho import MolecularLoader, GraphBuilder
+from src.data.utils import iter_mol2_batch
 from src.model.models.msk1 import EndtoEndModel as MSK_1
 from src.model.models.msk_ab import EndtoEndModel as MSK_ablation
 from configs.config_loader import load_config, Config
@@ -524,42 +525,52 @@ class GeneralDataset:
                 continue
 
             keyatoms_dict = self.loader.load_keyatoms(keyatom_path, targetname="")
-            mol_data = self.loader.read_mol2_batch(mol2_path, tags=None)
-            if mol_data is None:
-                continue
-            elems, qs, bonds, borders, xyz, nneighs, atms, atypes, tags = mol_data
             source = Path(mol2_path).stem
 
-            # Build per-compound arg tuples. Only send picklable data - the
-            # graph_builder is primed inside workers via ProcessPool initializer.
-            items = []
-            for elem, q, bond, border, coord, nneigh, atm, atype, tag in zip(
-                    elems, qs, bonds, borders, xyz, nneighs, atms, atypes, tags):
-                items.append((elem, q, bond, border, coord, nneigh, atm, atype, tag,
-                              keyatoms_dict.get(tag), drop_H, source))
-
-            # Chunk compounds so per-worker IPC cost is amortized. Using
-            # ~4x n_workers chunks gives decent load balancing without too
-            # many chunks. batch_size stays as the eventual yield unit.
+            # Stream: consume compounds one at a time via iter_mol2_batch,
+            # accumulate submit_chunk_size items, submit to build_pool, drain
+            # completed futures to yield batches. Peak in-memory footprint is
+            # ~(submit_chunk_size + a few in-flight futures + batch_size)
+            # compounds, independent of the source mol2 size.
             n_workers = getattr(pool, '_max_workers', 8)
-            n_chunks = max(1, min(n_workers * 4, max(1, len(items) // 100)))
-            chunk_size = max(1, (len(items) + n_chunks - 1) // n_chunks)
-            chunks = [items[i:i + chunk_size] for i in range(0, len(items), chunk_size)]
+            submit_chunk_size = 128
+            max_in_flight = n_workers * 4
 
-            futures = [pool.submit(_build_compound_chunk, c) for c in chunks]
-
+            pending = []
+            futures = []
             batch = []
-            for fut in futures:
-                results = fut.result()
-                for r in results:
-                    if r is None:
-                        continue
-                    batch.append(r)
-                    if len(batch) >= batch_size:
-                        yield batch
-                        batch = []
+
+            def _drain(block_until):
+                """Pop and process completed futures until <= block_until remain."""
+                while len(futures) > block_until:
+                    fut = futures.pop(0)
+                    for r in fut.result():
+                        if r is None:
+                            continue
+                        batch.append(r)
+                        if len(batch) >= batch_size:
+                            yield batch
+                            batch.clear()
+
+            for elem, q, bond, border, coord, nneigh, atm, atype, tag in iter_mol2_batch(
+                    mol2_path, drop_H=drop_H, tags_read=None):
+                pending.append((elem, q, bond, border, coord, nneigh, atm, atype, tag,
+                                keyatoms_dict.get(tag), drop_H, source))
+                if len(pending) >= submit_chunk_size:
+                    futures.append(pool.submit(_build_compound_chunk, pending))
+                    pending = []
+                    if len(futures) >= max_in_flight:
+                        yield from _drain(max_in_flight - n_workers)
+
+            if pending:
+                futures.append(pool.submit(_build_compound_chunk, pending))
+                pending = []
+
+            yield from _drain(0)
+
             if batch:
                 yield batch
+                batch = []
 
 
 def load_model(checkpoint: str, config: Config, device: torch.device) -> torch.nn.Module:

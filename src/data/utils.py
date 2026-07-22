@@ -157,135 +157,175 @@ def read_mol2(mol2,drop_H=False):
     return np.array(elems)[nonHid], np.array(qs)[nonHid], bonds, borders, np.array(xyzs)[nonHid], np.array(nneighs,dtype=float)[nonHid], list(np.array(atms)[nonHid])
 
 
-def read_mol2_batch(mol2, tags_read=None, drop_H=True, tag_only=False):
-    qs_s, elems_s, xyzs_s = {}, {}, {}
-    bonds_s, borders_s = {}, {}
-    atms_s, nneighs_s, atypes_s = {}, {}, {}
-    tags = []
+def _finalize_mol2_molecule(elems, qs, bonds, borders, xyzs, atms, atypes, tag, drop_H):
+    """Compute nneighs and (optionally) strip hydrogens for one molecule.
 
-    cont = open(mol2).readlines()
-    il = [i for i, l in enumerate(cont) if l.startswith('@<TRIPOS>MOLECULE')] + [len(cont)]
-    ihead = np.zeros(len(cont)+1, dtype=bool)
-    ihead[il] = True
+    Returns (elem, q, bond, border, coord, nneigh, atm, atype, tag) or None.
+    Extracted from read_mol2_batch's inner save_current_molecule so both the
+    streaming iterator and the list-returning batch reader can share it.
+    """
+    if tag is None or not qs:
+        return None
+    nneighs = [[0, 0, 0, 0] for _ in qs]
+    for i, j in bonds:
+        if elems[i] in ['H', 'C', 'N', 'O']:
+            k = ['H', 'C', 'N', 'O'].index(elems[i])
+            nneighs[j][k] += 1.0
+        if elems[j] in ['H', 'C', 'N', 'O']:
+            l = ['H', 'C', 'N', 'O'].index(elems[j])
+            nneighs[i][l] += 1.0
+    if drop_H:
+        nonHid = [i for i, a in enumerate(elems) if a != 'H']
+    else:
+        nonHid = list(range(len(elems)))
+    nonH_set = set(nonHid)
+    nonH_map = {old: new for new, old in enumerate(nonHid)}
+    bonds_filt = [[nonH_map[i], nonH_map[j]]
+                  for i, j in bonds if i in nonH_set and j in nonH_set]
+    borders_filt = [b for b, ij in zip(borders, bonds)
+                    if ij[0] in nonH_set and ij[1] in nonH_set]
+    return (
+        np.array(elems)[nonHid],
+        np.array(qs)[nonHid],
+        bonds_filt,
+        borders_filt,
+        np.array(xyzs)[nonHid],
+        np.array(nneighs, dtype=float)[nonHid],
+        list(np.array(atms)[nonHid]),
+        np.array(atypes)[nonHid],
+        tag,
+    )
 
-    # 초기화
-    qs = elems = xyzs = bonds = borders = atms = atypes = []
+
+def iter_mol2_batch(mol2, drop_H=True, tags_read=None):
+    """Stream a multi-molecule mol2, yielding one compound tuple at a time.
+
+    Yields (elem, q, bond, border, coord, nneigh, atm, atype, tag) per compound.
+
+    Never holds more than one compound in memory at a time. Use this instead
+    of read_mol2_batch when a file is large (>~500 MB) or the caller can
+    consume incrementally -- the batch reader loads all lines into memory and
+    stalls on multi-hundred-thousand-compound files.
+
+    tags_read: if provided, only yield compounds whose tag is in this set.
+    """
+    tags_set = set(tags_read) if tags_read is not None else None
+    STATE_IDLE, STATE_TAG, STATE_WAIT, STATE_ATOM, STATE_BOND, STATE_SKIP = range(6)
+
+    qs, elems, xyzs, bonds, borders, atms, atypes = [], [], [], [], [], [], []
     tag = None
-    read_cont = 0
+    state = STATE_IDLE
 
-    def save_current_molecule():
-        if tag is None or (tag_only or (tags_read is not None and tag not in tags_read)):
-            return
-        nneighs = [[0,0,0,0] for _ in qs]
-        for i, j in bonds:
-            if elems[i] in ['H','C','N','O']:
-                k = ['H','C','N','O'].index(elems[i])
-                nneighs[j][k] += 1.0
-            if elems[j] in ['H','C','N','O']:
-                l = ['H','C','N','O'].index(elems[j])
-                nneighs[i][l] += 1.0
+    def _reset():
+        return [], [], [], [], [], [], []
 
-        if drop_H:
-            nonHid = [i for i, a in enumerate(elems) if a != 'H']
-        else:
-            nonHid = list(range(len(elems)))
-        nonH_set = set(nonHid)
-        nonH_map = {old: new for new, old in enumerate(nonHid)}
-        bonds_filt = [[nonH_map[i], nonH_map[j]] for i,j in bonds if i in nonH_set and j in nonH_set]
-        borders_filt = [b for b, ij in zip(borders, bonds) if ij[0] in nonH_set and ij[1] in nonH_set]
-        elems_s[tag]   = np.array(elems)[nonHid]
-        qs_s[tag]      = np.array(qs)[nonHid]
-        bonds_s[tag]   = bonds_filt
-        borders_s[tag] = borders_filt
-        xyzs_s[tag]    = np.array(xyzs)[nonHid]
-        nneighs_s[tag] = np.array(nneighs, dtype=float)[nonHid]
-        atms_s[tag]    = list(np.array(atms)[nonHid])
-        atypes_s[tag]  = np.array(atypes)[nonHid]
-
-    for i, l in enumerate(cont):
-        if l.startswith('#'):
-            continue
-
-        if ihead[i]:
-            save_current_molecule()
-
-            read_cont = 3
-            tag = cont[i+1].strip()
-            if tag not in tags:
-                tags.append(tag)
-            qs, elems, xyzs, bonds, borders, atms, atypes = [], [], [], [], [], [], []
-            continue
-
-        if (not ihead[i+1] and len(l.strip()) <= 1) or tag is None:
-            continue
-
-        if read_cont == 3:
-            if tags_read is None or tag in tags_read:
-                read_cont = 4
-            else:
-                read_cont = -1
-            continue
-
-        if read_cont < 0 or tag_only:
-            continue
-
-        if l.startswith('@<TRIPOS>ATOM'):
-            read_cont = 1
-            continue
-        elif l.startswith('@<TRIPOS>BOND'):
-            read_cont = 2
-            continue
-        elif l.startswith('@<TRIPOS>SUBSTRUCTURE') or l.startswith('@<TRIPOS>UNITY_ATOM_ATTR'):
-            read_cont = 0
-            continue
-
-        if read_cont == 1:
-            words = l.strip().split()
-            if len(words) < 6:
+    with open(mol2) as f:
+        for l in f:
+            if l.startswith('#'):
                 continue
-            name = words[1]
-            if name.startswith('BR'):
-                name = 'Br'
-            # same elem logic as in read_mol2
-            try:
-                elem = words[5].split('.')[0]
-            except IndexError:
-                if name.startswith('Br') or name.startswith('Cl'):
-                    elem = name[:2]
+
+            if l.startswith('@<TRIPOS>MOLECULE'):
+                if state not in (STATE_IDLE, STATE_SKIP):
+                    out = _finalize_mol2_molecule(
+                        elems, qs, bonds, borders, xyzs, atms, atypes, tag, drop_H)
+                    if out is not None:
+                        yield out
+                qs, elems, xyzs, bonds, borders, atms, atypes = _reset()
+                tag = None
+                state = STATE_TAG
+                continue
+
+            if state == STATE_TAG:
+                tag = l.strip()
+                if tags_set is not None and tag not in tags_set:
+                    state = STATE_SKIP
                 else:
-                    elem = name[0]
-
-            if elem not in ELEMS:
-                elem = 'Null'
-
-            atms.append(words[1])
-            atypes.append(words[5])
-            elems.append(elem)
-            xyzs.append([float(words[2]), float(words[3]), float(words[4])])
-            qs.append(float(words[-1]) if len(words) >= 9 else 0.0)
-
-        elif read_cont == 2:
-            words = l.strip().split()
-            if len(words) < 4:
+                    state = STATE_WAIT
                 continue
-            i1, i2 = int(words[1])-1, int(words[2])-1
-            bondtype = {'0':0, '1':1, '2':2, '3':3, 'ar':3, 'am':2, 'du':0, 'un':0}.get(words[3], 0)
-            bonds.append([i1, i2])
-            borders.append(bondtype)
 
-    save_current_molecule()
+            if state == STATE_SKIP:
+                continue
 
-    tags_order = [tag for tag in (tags_read or tags) if tag in tags]
-    if not tag_only:
-        elems_s   = [elems_s[tag]   for tag in tags_order]
-        qs_s      = [qs_s[tag]      for tag in tags_order]
-        bonds_s   = [bonds_s[tag]   for tag in tags_order]
-        borders_s = [borders_s[tag] for tag in tags_order]
-        xyzs_s    = [xyzs_s[tag]    for tag in tags_order]
-        nneighs_s = [nneighs_s[tag] for tag in tags_order]
-        atms_s    = [atms_s[tag]    for tag in tags_order]
-        atypes_s  = [atypes_s[tag]  for tag in tags_order]
+            if l.startswith('@<TRIPOS>ATOM'):
+                state = STATE_ATOM
+                continue
+            if l.startswith('@<TRIPOS>BOND'):
+                state = STATE_BOND
+                continue
+            if l.startswith('@<TRIPOS>'):
+                state = STATE_WAIT
+                continue
 
+            if state == STATE_ATOM:
+                words = l.strip().split()
+                if len(words) < 6:
+                    continue
+                name = words[1]
+                if name.startswith('BR'):
+                    name = 'Br'
+                try:
+                    elem = words[5].split('.')[0]
+                except IndexError:
+                    if name.startswith('Br') or name.startswith('Cl'):
+                        elem = name[:2]
+                    else:
+                        elem = name[0]
+                if elem not in ELEMS:
+                    elem = 'Null'
+                atms.append(words[1])
+                atypes.append(words[5])
+                elems.append(elem)
+                xyzs.append([float(words[2]), float(words[3]), float(words[4])])
+                qs.append(float(words[-1]) if len(words) >= 9 else 0.0)
+            elif state == STATE_BOND:
+                words = l.strip().split()
+                if len(words) < 4:
+                    continue
+                i1, i2 = int(words[1]) - 1, int(words[2]) - 1
+                bondtype = {'0': 0, '1': 1, '2': 2, '3': 3, 'ar': 3, 'am': 2, 'du': 0, 'un': 0}.get(words[3], 0)
+                bonds.append([i1, i2])
+                borders.append(bondtype)
+
+    if state not in (STATE_IDLE, STATE_SKIP):
+        out = _finalize_mol2_molecule(
+            elems, qs, bonds, borders, xyzs, atms, atypes, tag, drop_H)
+        if out is not None:
+            yield out
+
+
+def read_mol2_batch(mol2, tags_read=None, drop_H=True, tag_only=False):
+    """Read all compounds from a multi-molecule mol2 into parallel lists.
+
+    Backward-compatible wrapper around iter_mol2_batch. For very large files
+    prefer iter_mol2_batch directly to avoid holding every compound in memory.
+    """
+    if tag_only:
+        tags = []
+        with open(mol2) as f:
+            saw_molecule = False
+            for l in f:
+                if l.startswith('@<TRIPOS>MOLECULE'):
+                    saw_molecule = True
+                    continue
+                if saw_molecule:
+                    tags.append(l.strip())
+                    saw_molecule = False
+        return [], [], [], [], [], [], [], [], tags
+
+    elems_s, qs_s, bonds_s, borders_s = [], [], [], []
+    xyzs_s, nneighs_s, atms_s, atypes_s = [], [], [], []
+    tags_order = []
+    for out in iter_mol2_batch(mol2, drop_H=drop_H, tags_read=tags_read):
+        elem, q, bond, border, coord, nneigh, atm, atype, tag = out
+        elems_s.append(elem)
+        qs_s.append(q)
+        bonds_s.append(bond)
+        borders_s.append(border)
+        xyzs_s.append(coord)
+        nneighs_s.append(nneigh)
+        atms_s.append(atm)
+        atypes_s.append(atype)
+        tags_order.append(tag)
     return elems_s, qs_s, bonds_s, borders_s, xyzs_s, nneighs_s, atms_s, atypes_s, tags_order
 
 
