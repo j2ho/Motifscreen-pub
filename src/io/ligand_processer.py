@@ -169,49 +169,175 @@ def _brics_keyatoms_from_mol2_block(mol2_block, mol_atom_names, atms, mol2xyz_ta
     return key_atm_list if key_atm_list else None
 
 
-def _worker(args):
-    """Multiprocessing worker: BRICS on one mol2 block."""
-    tag, block, atms, mol2xyz_tag = args
+def _prescreen_worker(args):
+    """Worker: try direct MolFromMol2Block; return None if OK, tag if failed."""
+    tag, block = args
+    m = Chem.MolFromMol2Block(block, sanitize=True, removeHs=True)
+    return None if m is not None else tag
+
+
+def _brics_worker(args):
+    """Worker: parse text block (mol2 or sdf), then BRICS on the mol."""
+    tag, block, fmt, atms, mol2xyz_tag = args
     try:
-        atom_names = _parse_atom_names_from_block(block)
-        keys = _brics_keyatoms_from_mol2_block(block, atom_names, atms, mol2xyz_tag)
+        atom_names = _parse_atom_names_from_block(block) if fmt == 'mol2' else None
+        if fmt == 'mol2':
+            m = Chem.MolFromMol2Block(block, sanitize=True, removeHs=True)
+        else:
+            m = Chem.MolFromMolBlock(block, sanitize=True, removeHs=True)
+        if m is None:
+            return None
+        if atom_names is None:
+            atom_names = [a.GetSymbol() + str(i) for i, a in enumerate(m.GetAtoms())]
+        keys = _brics_keyatoms_from_mol(m, atom_names, atms, mol2xyz_tag)
         return (tag, keys) if keys else None
     except Exception:
         return None
 
 
+def _brics_keyatoms_from_mol(m, mol_atom_names, atms, mol2xyz_tag):
+    """BRICS + keyatom picking on an already-parsed RDKit mol."""
+    heavy_names = [name for name in mol_atom_names if not name.startswith('H')]
+    if len(heavy_names) != m.GetNumAtoms():
+        heavy_names = mol_atom_names[:m.GetNumAtoms()]
+    for i, atm in enumerate(m.GetAtoms()):
+        atm.SetAtomMapNum(i)
+    try:
+        list(BRICSDecompose(m))
+        m2 = BreakBRICSBonds(m)
+        frags = Chem.GetMolFrags(m2, asMols=True)
+    except Exception:
+        return None
+    atmxyz = {a: x for a, x in zip(atms, mol2xyz_tag)}
+    key_atm_list = []
+    for f in frags:
+        frag_atom_names = []
+        for atm in f.GetAtoms():
+            if atm.GetSymbol() == '*':
+                continue
+            i = atm.GetAtomMapNum()
+            if i < len(heavy_names):
+                frag_atom_names.append(heavy_names[i].strip())
+        picked = _select_closest_to_com(atmxyz, frag_atom_names)
+        if picked is not None:
+            key_atm_list.append(picked)
+    if len(key_atm_list) < 4:
+        npick = 4 - len(key_atm_list)
+        candidates = [a for a in atms if a not in key_atm_list and not a.startswith('H')]
+        if candidates:
+            toadd = list(np.random.choice(
+                candidates, size=min(npick, len(candidates)), replace=False))
+            key_atm_list += toadd
+    return key_atm_list if key_atm_list else None
+
+
+def _batch_obabel_fallback(fail_blocks, timeout=1200):
+    """One obabel subprocess converts all failed mol2 blocks to SDF at once.
+
+    Amortizes fork+exec across the whole batch (~30-80ms per subprocess
+    dropping to ~1ms per compound in aggregate).
+
+    Returns dict {tag: sdf_block} for compounds obabel could convert.
+    """
+    if not fail_blocks:
+        return {}
+    import subprocess
+    import tempfile
+    import shutil as _shutil
+    tmpdir = tempfile.mkdtemp(prefix='msk_batch_fallback_')
+    try:
+        mol2_path = os.path.join(tmpdir, 'fails.mol2')
+        sdf_path = os.path.join(tmpdir, 'fails.sdf')
+        with open(mol2_path, 'w') as f:
+            for tag, block in fail_blocks:
+                f.write(block)
+        try:
+            subprocess.run(
+                ['obabel', mol2_path, '-O', sdf_path],
+                capture_output=True, timeout=timeout, check=False)
+        except subprocess.TimeoutExpired:
+            logger.warning(f"obabel batch fallback timed out (>{timeout}s)")
+            return {}
+        if not os.path.exists(sdf_path) or os.path.getsize(sdf_path) == 0:
+            return {}
+        # SDF blocks are $$$$-terminated. obabel writes each mol's title (== mol2 name)
+        # on the first line of its SDF block. Match sdf blocks back to tags by title.
+        recovered = {}
+        buf = []
+        with open(sdf_path) as f:
+            for line in f:
+                buf.append(line)
+                if line.startswith('$$$$'):
+                    sdf_block = ''.join(buf)
+                    # First non-empty line is the title == compound tag
+                    title = None
+                    for L in sdf_block.splitlines():
+                        s = L.strip()
+                        if s:
+                            title = s
+                            break
+                    if title is not None:
+                        recovered[title] = sdf_block
+                    buf = []
+        return recovered
+    finally:
+        _shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def launch_batched_ligand(ligand_f, N=10, collated_npz='keyatom.def.npz'):
     """Compute BRICS keyatoms for every compound in a multi-mol mol2 file.
 
-    Direct mol2 -> RDKit -> BRICS. No PDB intermediate, no obabel dependency
-    at this stage. Coordinates and atom names come from the input mol2.
+    Two-pass batched design:
+      1. Parallel prescreen: identify mol2 blocks RDKit's strict parser rejects.
+      2. Single obabel subprocess: convert all failures to SDF at once.
+      3. Parallel BRICS: parse (mol2 for direct-OK, SDF for recovered) + BRICS.
 
     Args:
-        ligand_f: path to multi-molecule .mol2 (or a .pdb multi-model file
-                  for legacy compatibility)
+        ligand_f: path to multi-molecule .mol2 (or a legacy multi-model .pdb)
         N: number of parallel workers
         collated_npz: output path for the {tag: [key_atom_names]} npz
     """
-    if ligand_f.endswith('.mol2'):
-        mol2xyz, atms = xyz_from_mol2(ligand_f)
-        blocks = list(_read_mol2_blocks(ligand_f))
-        args_list = []
-        for tag, block in blocks:
-            if tag in mol2xyz:
-                args_list.append((tag, block, atms[tag], mol2xyz[tag]))
-    elif ligand_f.endswith('.pdb'):
-        # Legacy path preserved: users may still ship a multi-model PDB where
-        # coords came from an already-hydrogen'd mol2 upstream. Fall back to
-        # the PDB->RDKit route in this branch.
+    if ligand_f.endswith('.pdb'):
         return _launch_batched_pdb_legacy(ligand_f, N, collated_npz)
-    else:
+    if not ligand_f.endswith('.mol2'):
         raise ValueError(f"Unsupported ligand format: {ligand_f}")
+
+    mol2xyz, atms = xyz_from_mol2(ligand_f)
+    blocks = [(tag, block) for tag, block in _read_mol2_blocks(ligand_f)
+              if tag in mol2xyz]
+
+    # Pass 1: parallel prescreen for failures
+    prescreen_args = [(tag, block) for tag, block in blocks]
+    if N > 1:
+        with mp.Pool(processes=N) as pool:
+            fail_tags = pool.map(_prescreen_worker, prescreen_args)
+    else:
+        fail_tags = [_prescreen_worker(a) for a in prescreen_args]
+    fail_tag_set = {t for t in fail_tags if t is not None}
+    n_fail = len(fail_tag_set)
+    logger.info(f"  prescreen: {len(blocks) - n_fail}/{len(blocks)} direct-parse OK, "
+                f"{n_fail} need SDF fallback")
+
+    # Pass 2: batched obabel SDF conversion for the failures
+    fail_blocks = [(tag, block) for tag, block in blocks if tag in fail_tag_set]
+    recovered_sdf = _batch_obabel_fallback(fail_blocks) if fail_blocks else {}
+    logger.info(f"  batched-fallback: {len(recovered_sdf)}/{n_fail} recovered as SDF")
+
+    # Pass 3: parallel BRICS with pre-selected block format
+    brics_args = []
+    for tag, block in blocks:
+        if tag in fail_tag_set:
+            if tag in recovered_sdf:
+                brics_args.append((tag, recovered_sdf[tag], 'sdf', atms[tag], mol2xyz[tag]))
+            # else: dropped, no rescue
+        else:
+            brics_args.append((tag, block, 'mol2', atms[tag], mol2xyz[tag]))
 
     if N > 1:
         with mp.Pool(processes=N) as pool:
-            results = pool.map(_worker, args_list)
+            results = pool.map(_brics_worker, brics_args)
     else:
-        results = [_worker(a) for a in args_list]
+        results = [_brics_worker(a) for a in brics_args]
 
     keyatms = {}
     for r in results:
