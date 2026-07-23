@@ -19,10 +19,19 @@ dependencies = [
 
 [project.optional-dependencies]
 preprocessing = ["rdkit", "openbabel-wheel"]
+# Optional: PyRosetta enables the training-time protein prep (score_jd2
+# with H-optimization + HIS tautomer assignment). Ships a ~1 GB wheel
+# from the RosettaCommons mirror. Only needed if you want to run
+# scripts/prepare_with_pyrosetta.py; the default reduce-based path is
+# always available without this.
+rosetta = ["pyrosetta"]
 
 [tool.uv]
 package = false
-find-links = ["https://data.dgl.ai/wheels/cu117/repo.html"]
+find-links = [
+    "https://data.dgl.ai/wheels/cu117/repo.html",
+    "https://west.rosettacommons.org/pyrosetta/quarterly/release",
+]
 
 [[tool.uv.index]]
 name = "pytorch-cu117"
