@@ -60,6 +60,11 @@ def prepare_receptor(input_pdb: str, output_pdb: str, quiet: bool = True) -> int
         "-ex2aro",
         "-ignore_zero_occupancy false",
         "-ignore_unrecognized_res",
+        # Disable PDB-components-dict fallback. Without this, Rosetta silently
+        # matches unknown residues (e.g. HIY covalent HIS-inhibitor conjugate)
+        # to similarly-named entries loaded from the components dict, then
+        # crashes in fill_missing_atoms when the atom lists disagree.
+        "-load_PDB_components false",
     ]
     if quiet:
         init_flags.append("-mute all")
