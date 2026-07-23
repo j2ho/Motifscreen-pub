@@ -50,8 +50,17 @@ def prepare_receptor(input_pdb: str, output_pdb: str, quiet: bool = True) -> int
         return 2
 
     # Rosetta init flags. -no_optH false matches the training-time
-    # score_jd2 invocation. -mute all keeps the log quiet by default.
-    init_flags = ["-no_optH false", "-ex1", "-ex2aro", "-ignore_zero_occupancy false"]
+    # score_jd2 invocation. -ignore_unrecognized_res skips non-canonical
+    # residues (e.g. modified histidines like HIY, non-standard Cys states)
+    # instead of aborting - crystal structures routinely contain these and
+    # dropping them from the pose is the practical fix.
+    init_flags = [
+        "-no_optH false",
+        "-ex1",
+        "-ex2aro",
+        "-ignore_zero_occupancy false",
+        "-ignore_unrecognized_res",
+    ]
     if quiet:
         init_flags.append("-mute all")
 
