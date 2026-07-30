@@ -82,9 +82,9 @@ Full reproduction scripts + benchmark-specific notes: see [BENCHMARKS.md](BENCHM
 
 Architecture details, loss composition, and training-time inputs: see `docs/`.
 
-## Training data curation
+## ChEMBL data curation
 
-The model was trained on a curated ChEMBL-derived dataset. If you want to retrain from scratch or expand the training set with your own targets, the curation pipeline is a separate repository: [j2ho/chembl-q](https://github.com/j2ho/chembl-q). It filters ChEMBL activity data, selects artificial decoys with reasonable compound/target criteria, and provides a **leakage-resistant train/test split by receptor sequence similarity** against a supplied training-set FASTA (PDBbind + BioLip by default, easily swappable). Running chembl-q with the default settings reproduces the ChEMBL-LR benchmark this repo uses.
+The model was trained on a curated ChEMBL34-derived dataset along with PDBbind and BioLip data. If you want to use the ChEMBL dataset for training, but with the newer ChEMBL releases, the curation pipeline is a separate repository: [j2ho/chembl-q](https://github.com/j2ho/chembl-q). It filters ChEMBL activity data, selects artificial decoys with reasonable compound/target criteria, and provides a **leakage-resistant train/test split by receptor sequence similarity** against a supplied training-set FASTA (PDBbind + BioLip by default, easily swappable). Running chembl-q with the default settings reproduces the ChEMBL-LR benchmark this repo uses (may differ slightly from the original due to updates in ChEMBL).
 
 ## Repository layout
 
