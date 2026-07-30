@@ -44,11 +44,10 @@ mytarget,ZINC000012345,0.912,all_ligands
 mytarget,ZINC000098765,0.023,all_ligands
 ```
 
-Score is a sigmoid output in [0, 1] — higher = more likely binder.
+Score is in range [0, 1] where higher score is more likely to be a binder. Score should be evaluated as relative likeliness to be a binder within the same target. (e.g. target A could have active score 0.3 and decoy score 0.1 where target B could have active score of 0.7 and decoy score of 0.5) 
 
-Model checkpoint (`epoch70.pkl`, ~150 MB) + `endtoend.yaml` config: download from Zenodo, DOI [`10.5281/zenodo.<MODEL_DOI>`](https://doi.org/10.5281/zenodo.<MODEL_DOI>) (TODO: fill in at publish time).
+Model checkpoint + `endtoend.yaml` config: checkpoint to be uploaded. 
 
-Full walkthrough with pocket-center options, hydrogen addition alternatives, multi-GPU, troubleshooting: see [INFERENCE.md](INFERENCE.md).
 
 ## Benchmark reproduction
 
@@ -56,9 +55,9 @@ Download the pre-featurized benchmark tarball (~3.9 GB, ChEMBL-LR-107 + DUD-E-10
 
 ```bash
 # Fetch bench + verify
-wget https://zenodo.org/records/21371299/files/motifscreen_aff_benchmarks_v2.tar.gz
-echo "df2d57c7c2b4942af24216e6ed993d23c42ba3403cae9fdc42c41cae49d9f753  motifscreen_aff_benchmarks_v2.tar.gz" | sha256sum -c
-tar xzf motifscreen_aff_benchmarks_v2.tar.gz
+wget https://zenodo.org/records/21371299/files/motifscreen_benchmarks.tar.gz
+echo "df2d57c7c2b4942af24216e6ed993d23c42ba3403cae9fdc42c41cae49d9f753  motifscreen_benchmarks.tar.gz" | sha256sum -c
+tar xzf motifscreen_benchmarks.tar.gz
 
 # Score DUD-E
 uv run python motifscreen.py predict \
