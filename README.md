@@ -56,7 +56,7 @@ Download the pre-featurized benchmark tarball (~3.9 GB, ChEMBL-LR-107 + DUD-E-10
 
 ```bash
 # Fetch bench + verify
-wget https://zenodo.org/record/<BENCH_DOI>/files/motifscreen_aff_benchmarks_v2.tar.gz
+wget https://zenodo.org/records/21371299/files/motifscreen_aff_benchmarks_v2.tar.gz
 echo "df2d57c7c2b4942af24216e6ed993d23c42ba3403cae9fdc42c41cae49d9f753  motifscreen_aff_benchmarks_v2.tar.gz" | sha256sum -c
 tar xzf motifscreen_aff_benchmarks_v2.tar.gz
 

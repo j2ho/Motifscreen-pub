@@ -12,10 +12,10 @@ Use path A if you just want to reproduce numbers. Use path B if you want to see 
 
 ## Path A: pre-featurized tarball
 
-Download `motifscreen_aff_benchmarks_v2.tar.gz` (~3.9 GB) from Zenodo, DOI [`10.5281/zenodo.<BENCH_DOI>`](https://doi.org/10.5281/zenodo.<BENCH_DOI>) (TODO: fill at publish time).
+Download `motifscreen_aff_benchmarks_v2.tar.gz` (~3.9 GB) from Zenodo, DOI [`10.5281/zenodo.21371299`](https://doi.org/10.5281/zenodo.21371299).
 
 ```bash
-wget https://zenodo.org/record/<BENCH_DOI>/files/motifscreen_aff_benchmarks_v2.tar.gz
+wget https://zenodo.org/records/21371299/files/motifscreen_aff_benchmarks_v2.tar.gz
 echo "df2d57c7c2b4942af24216e6ed993d23c42ba3403cae9fdc42c41cae49d9f753  motifscreen_aff_benchmarks_v2.tar.gz" | sha256sum -c
 tar xzf motifscreen_aff_benchmarks_v2.tar.gz
 ```
