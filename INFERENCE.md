@@ -1,248 +1,216 @@
 # Inference Guide
 
-Screen compounds against a protein target using MotifScreen-Aff.
+Screen a compound library against a protein target with MotifScreen-Aff.
+
+Two commands: `prepare` featurizes a target (protein + compound library → npz + mol2 + keyatoms), `predict` scores compounds against the prepared target.
 
 ## Quick start
 
 ```bash
-# 1. Prepare: protein PDB + ligand SDF -> preprocessed files
+# 1. Add hydrogens (reduce is easiest; obabel / pdb2pqr also fine)
+reduce -BUILD receptor.pdb > receptor_h.pdb
+
+# 2. Prepare
 uv run python motifscreen.py prepare \
     --protein receptor_h.pdb \
     --ligands compounds.sdf \
     --center=12.5,34.2,8.7 \
-    --output results/my-screen/prepared
+    --output prepared/
 
-# 2. Predict: score compounds
+# 3. Predict
 uv run python motifscreen.py predict \
-    --datapath results/my-screen/prepared \
-    --checkpoint models/best.pkl \
+    --datapath prepared/ \
+    --checkpoint models/epoch70.pkl \
     --base-config configs/training/endtoend.yaml \
-    --run-name my-screen
+    --output scores.csv
 ```
 
-Output: `results/my-screen/scores.csv`
+Output `scores.csv`:
+```
+target_id,compound_id,score,source_mol2
+mytarget,ZINC000012345,0.912,all_ligands
+mytarget,ZINC000098765,0.023,all_ligands
+```
 
-## Installation
+Score is a sigmoid output in [0, 1]. Higher = predicted stronger binder.
+
+## Install checklist
 
 ```bash
-# Core (training + inference)
-uv sync
-
-# With preprocessing dependencies (prepare step)
 uv sync --extra preprocessing
 ```
 
-Required for `prepare`: RDKit (BRICS keyatom decomposition), OpenBabel (mol2 conversion, charge assignment).
-
-No Rosetta installation needed. Rosetta parameter files for atom typing are bundled in `data/rosetta_params/`.
+The `preprocessing` extra pulls in `rdkit` and `openbabel-wheel` — both required for `prepare`. No Rosetta needed (params files are bundled at `data/rosetta_params/`).
 
 ## Protein hydrogen addition
 
-The model was trained on protonated structures. Missing hydrogens will degrade prediction quality, particularly for hydrogen bond donor/acceptor features and partial charge assignment.
-
-**Recommended: Rosetta `score_jd2`.** This is what the model was trained with. Best atom-name consistency with the featurizer, and best downstream numbers if you want to reproduce paper results exactly:
+`prepare` expects a protonated PDB. Add hydrogens with any of these:
 
 ```bash
-# Requires a Rosetta install (free for academic use, register at rosettacommons.org)
-score_jd2.linuxgccrelease -s receptor.pdb -out:file:scorefile /dev/null \
-    -no_optH false -out:pdb -overwrite -out:path:pdb .
-# produces receptor_0001.pdb
-
-# Or point prepare.py at your Rosetta binary and let it protonate for you:
-uv run python motifscreen.py prepare \
-    --protein receptor.pdb \
-    --protonate-rosetta /path/to/score_jd2.linuxgccrelease \
-    ...
-```
-
-If Rosetta isn't installed, any of the following work fine in practice (with mild quality/coverage tradeoffs):
-
-```bash
-# reduce (Richardson lab, MIT license; usually preinstalled on Linux)
+# reduce (Richardson lab; typically preinstalled on Linux)
 reduce -BUILD receptor.pdb > receptor_h.pdb
 
-# OpenBabel (simplest, works for most cases)
+# OpenBabel
 obabel receptor.pdb -O receptor_h.pdb -h
 
-# PDBFixer (Python, also handles missing residues)
-# pip install pdbfixer
+# PDBFixer (also handles missing residues; pip install pdbfixer openmm)
 python -c "
 from pdbfixer import PDBFixer
 from openmm.app import PDBFile
 fixer = PDBFixer(filename='receptor.pdb')
-fixer.findMissingResidues()
-fixer.findMissingAtoms()
-fixer.addMissingAtoms()
-fixer.addMissingHydrogens(7.4)
+fixer.findMissingResidues(); fixer.findMissingAtoms()
+fixer.addMissingAtoms(); fixer.addMissingHydrogens(7.4)
 PDBFile.writeFile(fixer.topology, fixer.positions, open('receptor_h.pdb', 'w'))
 "
 ```
 
-`prepare` runs regardless of which tool you used, but expect ~1-3% of common PDBs to have residues with non-standard atom naming (metals, cofactors, alt-locs). The featurizer logs a warning and skips those residues rather than aborting.
+reduce and obabel are the two we've tested most. Small (<0.03 mean AUROC) prediction quality differences between protonation tools on standard benchmarks; reduce is the default recommendation.
 
-## Step 1: Prepare
+If you have Rosetta installed, you can also pass its `score_jd2` binary directly and let `prepare` handle protonation for you:
+```bash
+uv run python motifscreen.py prepare \
+    --protein receptor.pdb \
+    --ligands compounds.sdf \
+    --center=12.5,34.2,8.7 \
+    --protonate-rosetta /path/to/score_jd2.linuxgccrelease \
+    --output prepared/
+```
 
-Converts protein PDB + ligand SDF/mol2 into the preprocessed format the model expects.
+## Step 1: `prepare`
+
+Featurizes the target once.
 
 ### Inputs
 
-| Input | Format | Description |
+| Flag | Type | Meaning |
 |---|---|---|
-| `--protein` | PDB | Protein structure (with hydrogens). |
-| `--ligands` | SDF or mol2 | Compounds to screen. Multi-molecule file supported. |
-| `--center` | x,y,z | Binding site center coordinates. Use `=` for negative values: `--center=-3.7,-3.6,-8.0` |
-| `--output` | directory | Where to write preprocessed files. |
+| `--protein` | PDB path | Protonated protein structure |
+| `--ligands` | SDF or mol2 path | Compound library (multi-molecule) |
+| `--center=X,Y,Z` OR `--crystal-ligand PATH` | either | Binding site: coords, or COM of a reference ligand mol2 |
+| `--output` | dir | Target directory (created if missing) |
+| `--target-id` | string (opt) | Name for the target subdir (default: derived from PDB filename) |
 
-### Binding site center
+Negative coordinates need `=` syntax: `--center=-3.7,-3.6,-8.0` (without `=`, bash reads `-3.7` as a flag).
 
-Either provide coordinates directly or use a reference ligand:
-
-```bash
-# Explicit coordinates (use = for negative values)
---center=12.5,34.2,8.7
-
-# From a reference ligand (center of mass)
---crystal-ligand crystal_ligand.mol2
-```
-
-### What prepare produces
+### Optional flags
 
 ```
-results/my-screen/prepared/
-  {target}/
-    {target}.grid.npz               # 3D grid points around binding site
-    {target}.prop.npz               # Receptor properties (coords, charges, types, SASA, bonds)
-    batch_mol2s/
-      {compound}_b.mol2             # Compound mol2 with key atom definitions
-      {compound}_b.keyatom.def.npz  # BRICS fragment key atoms
+--gridsize 1.5              # Grid point spacing in Å (default 1.5)
+--padding 10.0              # Grid padding in Å around binding site (default 10.0)
+--clash 1.1                 # Clash cutoff for grid point pruning (default 1.1)
+--workers 4                 # Parallel workers for keyatom BRICS (default 4)
+--keep-hetatms RES,RES,...  # Non-standard residues to keep as protein atoms (e.g. cofactors)
+--skip-ligand-prep          # Skip obabel H-add + MMFF94 charge assignment (input mol2 must already have both)
+--protonate-rosetta PATH    # Path to Rosetta score_jd2 binary (alternative to pre-protonating)
+--precompute-graphs         # Also build DGL graphs at prep time (fast-path for reuse; opt-in)
 ```
 
-### All prepare options
+### What `prepare` produces
 
 ```
---protein           Protein PDB file (required)
---ligands           Compound file: SDF or mol2 (required)
---center            Binding site center as x,y,z (use = for negative values)
---crystal-ligand    Reference ligand for center (alternative to --center)
---output            Output directory (required)
---grid-spacing      Grid point spacing in Angstroms (default: 1.5)
---padding           Grid padding around binding site (default: 4.0)
---workers           Parallel workers for keyatom computation (default: 4)
+prepared/<target-id>/
+├── <target-id>_stripped.pdb        # Cleaned protein (HETATMs removed, whitelist honored)
+├── <target-id>.grid.npz            # Binding-site grid (~800 points near --center)
+├── <target-id>.prop.npz            # Per-atom receptor features (coords, charges, atypes, SASA, bonds)
+├── all_ligands.mol2                # Ligands with polar H + MMFF94 charges (one file, all compounds)
+└── all_ligands.keyatom.def.npz     # BRICS keyatoms per compound, dict keyed by compound ID
 ```
 
-## Step 2: Predict
+The `all_ligands.mol2` name comes from the `--ligands` filename stem. If you pass `--ligands foo.sdf`, you'll get `foo.mol2` and `foo.keyatom.def.npz` in the target dir.
 
-Runs the model on prepared data and outputs binding scores.
+## Step 2: `predict`
 
-### Using --run-name (recommended)
+Runs the model over a prepared target (or many prepared targets).
 
-```bash
-uv run python motifscreen.py predict \
-    --datapath results/my-screen/prepared \
-    --checkpoint models/best.pkl \
-    --base-config configs/training/endtoend.yaml \
-    --run-name my-screen
-```
-
-Output goes to `results/my-screen/scores.csv`. Keeps everything for a screening run under one directory.
-
-### Using --output (custom path)
+### Basic
 
 ```bash
 uv run python motifscreen.py predict \
     --datapath prepared/ \
-    --checkpoint models/best.pkl \
+    --checkpoint models/epoch70.pkl \
     --base-config configs/training/endtoend.yaml \
-    --output /path/to/scores.csv
+    --output scores.csv
+```
+
+`--datapath` is the parent directory containing per-target subdirs (each with a `.grid.npz`). All target subdirs are auto-detected and scored in one run. Output is a single CSV with a `target_id` column distinguishing them.
+
+### All predict flags
+
+```
+--datapath          Parent directory containing prepared/<target>/ subdirs (required)
+--checkpoint        Model checkpoint .pkl (required)
+--base-config       Model architecture config YAML (required — use configs/training/endtoend.yaml)
+--targets t1 t2 ... Only score these target IDs (default: auto-detect all)
+--output PATH       Output CSV path
+--run-name NAME     Alternative to --output: writes to results/<name>/scores.csv
+--mol2-pattern GLOB Ligand mol2 glob within a target dir (default: *.mol2)
+--batch-size N      Compounds per batch (default 64; drop to 16-32 on tight VRAM)
+--gpus IDS          GPU IDs, comma-separated (default: all visible)
+--num-workers N     CPU threads for graph building in multi-GPU mode (default 8)
+--device DEV        cuda or cpu (default cuda; use cpu for tiny screens without GPU)
 ```
 
 ### Output format
 
 ```csv
 target_id,compound_id,score,source_mol2
-3jdw,CHEMBL123,0.847,compounds_b
-3jdw,CHEMBL456,0.023,compounds_b
-3jdw,CHEMBL789,0.912,compounds_b
+mytarget,ZINC000012345,0.9124,all_ligands
+mytarget,ZINC000098765,0.0234,all_ligands
 ```
 
-Score is a binding probability (0 to 1). Higher = more likely to bind.
+Rows sorted by descending score across all targets.
 
 ### Multi-GPU
 
-Multiple GPUs are auto-detected. Or specify explicitly:
-
 ```bash
 uv run python motifscreen.py predict \
-    --datapath results/my-screen/prepared \
-    --checkpoint models/best.pkl \
+    --datapath prepared/ \
+    --checkpoint models/epoch70.pkl \
     --base-config configs/training/endtoend.yaml \
-    --run-name my-screen \
-    --gpus 0,1,2,3 \
-    --num-workers 8
+    --gpus 0,1 \
+    --batch-size 32 \
+    --output scores.csv
 ```
 
-Uses thread-based parallelism. Model replicas are loaded on each GPU, batches round-robin across them. Single GPU: `--gpus 0`. CPU: `--device cpu`.
+One model replica per GPU, batches round-robin across them. **2 GPUs is the sweet spot** — scaling is sub-linear above that (CPU-side featurization becomes the bottleneck).
 
-### All predict options
+### Throughput expectations
 
-```
---datapath          Directory with prepared data (required)
---checkpoint        Model checkpoint .pkl file (required)
---base-config       Model architecture config YAML (required)
---run-name          Run name -> results/{run-name}/scores.csv
---output            Output CSV path (alternative to --run-name)
---targets           Specific targets to score (default: auto-detect all)
---batch-size        Compounds per batch (default: 64)
---gpus              Comma-separated GPU IDs (default: auto-detect all)
---num-workers       Graph building threads for multi-GPU (default: 8)
---device            cuda or cpu (default: cuda)
-```
+Per-compound wallclock, ~15 ms including featurize + forward:
+- Single GPU (V100/A5000+): ~40-60 compounds/sec effective
+- 2 GPUs: ~70-90 compounds/sec effective
 
-### Multi-target screening
+So for a 500k-compound library on 2 GPUs, budget ~2 hours end-to-end (prep ~10-30 min + predict ~1.5-2 hr).
+
+For very large libraries (>100k compounds), the mol2 reader streams internally so memory stays bounded regardless of file size.
+
+## Multi-target screening
+
+Just call `prepare` per target, writing into the same parent directory, then run `predict` once over the whole tree:
 
 ```bash
-# Prepare multiple targets into the same run directory
-uv run python motifscreen.py prepare \
-    --protein target1_h.pdb --ligands lib.sdf \
-    --center=10,20,30 --output results/my-screen/prepared/target1
+uv run python motifscreen.py prepare --protein t1_h.pdb --ligands lib.sdf \
+    --center=10,20,30 --output prepared/ --target-id t1
 
-uv run python motifscreen.py prepare \
-    --protein target2_h.pdb --ligands lib.sdf \
-    --center=15,25,35 --output results/my-screen/prepared/target2
+uv run python motifscreen.py prepare --protein t2_h.pdb --ligands lib.sdf \
+    --center=15,25,35 --output prepared/ --target-id t2
 
-# Score all targets
 uv run python motifscreen.py predict \
-    --datapath results/my-screen/prepared \
-    --checkpoint models/best.pkl \
+    --datapath prepared/ \
+    --checkpoint models/epoch70.pkl \
     --base-config configs/training/endtoend.yaml \
-    --run-name my-screen
+    --gpus 0,1 \
+    --output scores.csv
 ```
 
-All targets auto-detected from subdirectories. Output: `results/my-screen/scores.csv` with `target_id` column distinguishing targets.
-
-### Output directory structure
-
-```
-results/my-screen/
-  prepared/
-    target1/
-      target1.grid.npz
-      target1.prop.npz
-      batch_mol2s/...
-    target2/...
-  scores.csv              # all scores, all targets
-```
-
-## Benchmarking
-
-For running standard benchmarks (DUD-E, ChEMBL, LIT-PCBA) with pre-processed data, see [BENCHMARK.md](BENCHMARK.md).
+For 3+ targets, the batched helper is easier: see `scripts/prepare_batch.sh` and `scripts/gen_manifest.py` (documented in [BENCHMARKS.md](BENCHMARKS.md)).
 
 ## Troubleshooting
 
-**"No grid points generated"**: binding site center is too far from the protein. Check `--center` coordinates or use `--crystal-ligand`.
+**"No grid points generated"**: `--center` coordinates aren't near any protein atoms. Sanity-check the coords, or use `--crystal-ligand` with a known bound ligand.
 
-**"KeyAtom computation failed"**: ligand couldn't be fragmented by BRICS. Usually happens with very small molecules (< 5 heavy atoms) or unusual chemistry. These compounds are skipped.
+**"No results produced"**: usually a keyatom-lookup mismatch. Confirm `all_ligands.keyatom.def.npz` exists in the target dir and its compound IDs match the mol2 records. If you split the mol2 into `batch_mol2s/`, keep the keyatom file at the target root — predict searches there.
 
-**GPU out of memory**: reduce `--batch-size` (default 64). For very large proteins (> 3000 atoms in binding site), try `--batch-size 5`.
+**GPU OOM**: lower `--batch-size` (16, then 8). Very large targets (>3000 receptor atoms in pocket) may need `--batch-size 5`.
 
-**Negative coordinates in --center**: use `=` syntax: `--center=-3.7,-3.6,-8.0` (without `=`, bash interprets `-` as a flag).
+**Negative coordinate parsed as flag**: use `=` syntax: `--center=-3.7,-3.6,-8.0`.

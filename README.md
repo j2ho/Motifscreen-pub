@@ -1,205 +1,124 @@
 # MotifScreen-Aff
 
-Multi-task virtual screening model combining motif prediction, structure prediction, and binding classification. Uses an SE(3)-equivariant transformer (or EGNN) for receptor grids and a GAT for ligand graphs, connected by trigonal attention modules.
+SE(3)-equivariant structure-based virtual screening model. Given a protein pocket + a compound library, it ranks compounds by predicted binding likelihood. Combines a receptor grid encoder (SE(3)-equivariant transformer) with a ligand GAT encoder, linked by trigonal attention.
 
-## Installation
+## Install
 
-Requires [uv](https://docs.astral.sh/uv/getting-started/installation/) and CUDA 11.7+.
+Requires Python 3.9, CUDA 11.7+ compatible GPU (or CPU fallback), and [uv](https://docs.astral.sh/uv/getting-started/installation/).
 
 ```bash
-uv sync
-
-# With preprocessing dependencies (for preparing new targets)
+git clone https://github.com/j2ho/Motifscreen-pub.git
+cd Motifscreen-pub
 uv sync --extra preprocessing
 ```
 
-Key dependencies: PyTorch 1.13.1, DGL 1.1.3, e3nn 0.5.1 (all managed via `pyproject.toml` + `uv.lock`).
+The `preprocessing` extra pulls in RDKit + openbabel-wheel, both required for the `prepare` step. See [INSTALL.md](INSTALL.md) for CUDA-version alternatives and troubleshooting.
 
-See [INSTALL.md](INSTALL.md) for detailed setup and troubleshooting.
+## Quick inference
 
-## Inference
-
-Two-step pipeline: prepare input files, then predict binding scores.
+Two commands: `prepare` featurizes a protein + a compound library once; `predict` scores compounds against the prepared receptor.
 
 ```bash
-# 1. Prepare: protein PDB + ligand SDF -> model input format
+# 1. Add hydrogens to your protein PDB (reduce is easiest)
+reduce -BUILD receptor.pdb > receptor_h.pdb
+
+# 2. Prepare: protein + compound library -> model input
 uv run python motifscreen.py prepare \
-    --protein receptor.pdb \
+    --protein receptor_h.pdb \
     --ligands compounds.sdf \
-    --center 12.5,34.2,8.7 \
+    --center=12.5,34.2,8.7 \
     --output prepared/
 
-# 2. Predict: score compounds
+# 3. Predict: score compounds
 uv run python motifscreen.py predict \
     --datapath prepared/ \
-    --checkpoint models/best.pkl \
+    --checkpoint models/epoch70.pkl \
     --base-config configs/training/endtoend.yaml \
     --output scores.csv
 ```
 
-Protein structures should have hydrogens added beforehand (see below). No Rosetta installation needed; atom typing parameters are bundled.
-
-See [INFERENCE.md](INFERENCE.md) for full details: hydrogen addition, binding site definition, multi-target screening, troubleshooting.
-
-### Hydrogen addition
-
-The model expects protonated structures. Add hydrogens before `prepare`:
-
-```bash
-# OpenBabel (simplest)
-obabel receptor.pdb -O receptor_h.pdb -h
-
-# reduce (better for proteins)
-reduce -BUILD receptor.pdb > receptor_h.pdb
+Output `scores.csv`:
+```
+target_id,compound_id,score,source_mol2
+mytarget,ZINC000012345,0.912,all_ligands
+mytarget,ZINC000098765,0.023,all_ligands
 ```
 
-### Multi-GPU inference
+Score is a sigmoid output in [0, 1] — higher = more likely binder.
 
-Multiple GPUs are auto-detected and used. Or specify explicitly:
+Model checkpoint (`epoch70.pkl`, ~150 MB) + `endtoend.yaml` config: download from Zenodo, DOI [`10.5281/zenodo.<MODEL_DOI>`](https://doi.org/10.5281/zenodo.<MODEL_DOI>) (TODO: fill in at publish time).
+
+Full walkthrough with pocket-center options, hydrogen addition alternatives, multi-GPU, troubleshooting: see [INFERENCE.md](INFERENCE.md).
+
+## Benchmark reproduction
+
+Download the pre-featurized benchmark tarball (~3.9 GB, ChEMBL-LR-107 + DUD-E-100 + LIT-PCBA-13) from Zenodo and run `predict` directly — no user-side prep needed:
 
 ```bash
+# Fetch bench + verify
+wget https://zenodo.org/record/<BENCH_DOI>/files/motifscreen_aff_benchmarks_v2.tar.gz
+echo "df2d57c7c2b4942af24216e6ed993d23c42ba3403cae9fdc42c41cae49d9f753  motifscreen_aff_benchmarks_v2.tar.gz" | sha256sum -c
+tar xzf motifscreen_aff_benchmarks_v2.tar.gz
+
+# Score DUD-E
 uv run python motifscreen.py predict \
-    --datapath prepared/ \
-    --checkpoint models/best.pkl \
+    --datapath motifscreen_aff_benchmarks/dude_bench/prepared \
+    --checkpoint models/epoch70.pkl \
     --base-config configs/training/endtoend.yaml \
-    --gpus 0,1,2,3 \
-    --num-workers 8 \
-    --output scores.csv
+    --gpus 0,1 \
+    --output dude_scores.csv
 ```
 
-Single GPU: auto if only 1 GPU visible, or `--gpus 0`. CPU: `--device cpu`.
+Full reproduction scripts + benchmark-specific notes: see [BENCHMARKS.md](BENCHMARKS.md).
 
-## Benchmarking
+## Model
 
-Run standard benchmarks (DUD-E, ChEMBL, LIT-PCBA) for any model checkpoint:
+- SE(3)-equivariant transformer for the receptor pocket grid (~800 grid points)
+- GAT for ligand molecular graph
+- Trigonal attention crossover between the two
+- Outputs: motif labels on the grid, predicted key-atom positions, and a binding score for ranking
 
-```bash
-# All benchmarks, parallel SLURM jobs
-bash inf_scripts/run_benchmark_parallel.sh my-model models/my-model/best.pkl chembl,dude,litpcba 2 nova015
+Architecture details, loss composition, and training-time inputs: see `docs/`.
 
-# Compare runs
-uv run python results/analysis/compare_benchmarks.py run1 run2
-```
-
-See [BENCHMARK.md](BENCHMARK.md) for target lists, output structure, multi-GPU options, and analysis tools.
-
-## Training
-
-Training uses DDP across multiple GPUs.
-
-### Training modes
-
-| Mode | Config | Description |
-|------|--------|-------------|
-| Pretrain | `configs/training/pretrain.yaml` | Motif + structure only (no screening) |
-| Transfer | `configs/training/transfer.yaml` | Full model from pretrained checkpoint |
-| End-to-end | `configs/training/endtoend.yaml` | Full model from scratch |
-
-EGNN variants: `pretrain_egnn.yaml`, `transfer_egnn.yaml`, `endtoend_egnn.yaml`.
-
-### Running
-
-```bash
-# Transfer learning
-uv run python -m scripts.train.train \
-    --config configs/training/transfer.yaml \
-    --version ablation \
-    --model_note my-transfer \
-    --chkpt_name models/sm-pretrain/epoch150.pkl \
-    --transfer
-
-# End-to-end
-uv run python -m scripts.train.train \
-    --config configs/training/endtoend.yaml \
-    --version ablation \
-    --model_note my-e2e
-```
-
-### Config essentials
-
-```yaml
-data:
-  datapath: "/path/to/your/database/"   # external DB with npz/mol2 per target
-
-training:
-  lr: 1.0e-4            # 5e-5 for transfer
-  ddp: true              # multi-GPU
-  wandb_mode: "online"   # "online", "offline", or "disabled"
-```
-
-### Loss system
+## Repository layout
 
 ```
-loss = w_motif * (motif_pos + motif_neg)
-     + w_motif_contrast * motif_contrast
-     + warmup * (w_str * structure + w_str_pair * pairwise + w_str_attmap * attention)
-     + screen_source_weight * (w_screen_bce * bce + w_screen_rank * ranking + w_screen_contrast * contrast)
-     + w_penalty * l2_reg
+Motifscreen-pub/
+├── motifscreen.py                # CLI entry (prepare + predict subcommands)
+├── src/
+│   ├── cli/                      # prepare.py, predict.py
+│   ├── data/                     # dataset, mol2 parsing, SASA, graph building
+│   ├── model/                    # SE(3) + GAT + trigon attention
+│   └── io/                       # protein/ligand file utilities
+├── scripts/
+│   ├── prepare_batch.sh          # multi-target parallel prepare
+│   ├── gen_manifest.py           # auto-manifest from a directory of targets
+│   ├── run_dude_bench.sh         # DUD-E-100 reproduction
+│   ├── run_litpcba_bench.sh      # LIT-PCBA-14 reproduction
+│   └── download_and_prepare_chembl_bench.sh
+├── configs/
+│   ├── training/endtoend.yaml    # architecture config (also needed by predict)
+│   └── inference/                # benchmark configs
+├── data/
+│   ├── rosetta_params/           # bundled residue-type params (no Rosetta install needed)
+│   ├── generic_potential/        # ligand atom typing
+│   ├── dude_bench_manifest.tsv
+│   ├── litpcba_bench_manifest.tsv
+│   └── chembl_bench_manifest.tsv
+├── docs/
+│   ├── model-architecture.md
+│   ├── input-features.md
+│   ├── outputs.md
+│   └── losses.md
+├── INSTALL.md
+├── INFERENCE.md
+└── BENCHMARKS.md
 ```
 
-Enrichment optimization options:
-- `screen_rank_alpha`: top-weighted pairwise loss (0 = AUC, 20 = BEDROC-aware)
-- `screen_cont_top_k/top_weight/margin`: hard decoy weighting in contrast loss
-- `hard_neg_capacity`: memory bank of hard negatives across batches (0 = disabled)
-- `screen_source_weight`: per-data-source screening weight (e.g., chembl: 1.0, pdbbind: 0.0)
+## Citation
 
-### Output
+TODO: preprint DOI at publish time.
 
-```
-models/{model_note}/
-  model.pkl     # latest checkpoint
-  best.pkl      # best validation loss
-  epoch{N}.pkl  # periodic snapshots
-```
+## License
 
-## Data setup
-
-Training data structure under `datapath`:
-
-```
-{datapath}/
-  pdbbind/{target_id}/
-    {target_id}.grid.npz          # binding site grid
-    {target_id}.prop.npz          # receptor properties
-    {target_id}.keyatom.def.npz   # key atom definitions
-    ligand.mol2                   # native ligand
-  biolip/{target_id}/...
-  chembl/{target_id}/
-    {target_id}.grid.npz
-    {target_id}.prop.npz
-    batch_mol2s/                  # batched compounds (active + decoys)
-```
-
-Target lists: `data/final-set-260301/pbc_train.txt`, `pbc_valid.txt`.
-
-## Project structure
-
-```
-MotifScreen-Aff/
-  motifscreen.py              # CLI entry point (prepare + predict)
-  src/
-    cli/                      # prepare.py, predict.py
-    data/                     # dataset, mol2 parsing, SASA, graph building
-    model/
-      models/                 # SE(3) and EGNN architectures
-      modules/                # trigon attention, featurizers
-      loss/                   # screening, motif, structure losses
-    io/                       # protein/ligand file utilities
-  scripts/
-    train/                    # training script
-    inference/                # benchmark scripts (single + multi-GPU)
-  configs/
-    training/                 # pretrain, transfer, e2e configs
-    inference/                # benchmark configs
-    config_loader.py          # config dataclasses
-  data/
-    rosetta_params/           # atom typing parameters (bundled)
-    generic_potential/        # ligand atom typing (bundled)
-    final-set-260301/         # train/valid target lists
-  train_scripts/              # SLURM scripts for training
-  inf_scripts/                # SLURM scripts for inference + benchmarks
-  results/analysis/           # comparison script + notebook
-  INFERENCE.md                # inference guide
-  BENCHMARK.md                # benchmarking guide
-  INSTALL.md                  # installation details
-```
+MIT (see [LICENSE](LICENSE)).
