@@ -114,7 +114,3 @@ Motifscreen-pub/
 └── BENCHMARKS.md
 ```
 
-
-## License
-
-MIT (see [LICENSE](LICENSE)).
