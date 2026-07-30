@@ -2,7 +2,6 @@
   <img src="assets/motifscreen-logo.png" alt="MotifScreen" width="450"/>
 </p>
 
-# MotifScreen
 
 SE(3)-equivariant structure-based virtual screening model. Given a protein pocket + a compound library, it ranks compounds by predicted binding likelihood. Combines a receptor grid encoder (SE(3)-equivariant transformer) with a ligand GAT encoder, linked by trigonal attention.
 
