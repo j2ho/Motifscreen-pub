@@ -1,4 +1,8 @@
-# MotifScreen-Aff
+<p align="center">
+  <img src="assets/motifscreen-logo.png" alt="MotifScreen" width="450"/>
+</p>
+
+# MotifScreen
 
 SE(3)-equivariant structure-based virtual screening model. Given a protein pocket + a compound library, it ranks compounds by predicted binding likelihood. Combines a receptor grid encoder (SE(3)-equivariant transformer) with a ligand GAT encoder, linked by trigonal attention.
 
@@ -78,6 +82,10 @@ Full reproduction scripts + benchmark-specific notes: see [BENCHMARKS.md](BENCHM
 - Outputs: motif labels on the grid, predicted key-atom positions, and a binding score for ranking
 
 Architecture details, loss composition, and training-time inputs: see `docs/`.
+
+## Training data curation
+
+The model was trained on a curated ChEMBL-derived dataset. If you want to retrain from scratch or expand the training set with your own targets, the curation pipeline is a separate repository: [j2ho/chembl-q](https://github.com/j2ho/chembl-q). It filters ChEMBL activity data, selects artificial decoys with reasonable compound/target criteria, and provides a **leakage-resistant train/test split by receptor sequence similarity** against a supplied training-set FASTA (PDBbind + BioLip by default, easily swappable). Running chembl-q with the default settings reproduces the ChEMBL-LR benchmark this repo uses.
 
 ## Repository layout
 
