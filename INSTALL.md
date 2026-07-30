@@ -43,22 +43,3 @@ Also update the DGL find-links line to match (`https://data.dgl.ai/wheels/cu118/
 
 CUDA is not strictly required — passing `--device cpu` to `predict` works but is ~10-50x slower than a single GPU. Practical only for a handful of compounds.
 
-## Troubleshooting
-
-**`uv sync` fails on the PyTorch or DGL wheel**: your CUDA version doesn't match the index URLs. See the CUDA-version table above.
-
-**`ImportError: libcudart.so.11.0`**: the wheel expects CUDA 11.7 runtime. Either install CUDA 11.7, or switch to the CUDA-version matching your driver (see table).
-
-**`e3nn` version conflict**: `e3nn 0.5.1` requires PyTorch 1.13.x. If you need a different PyTorch, bump `e3nn` in `pyproject.toml` accordingly (0.5.x is fine for 1.13.x; 0.5.2+ needed for 2.x).
-
-**`openbabel` not found at runtime**: `openbabel-wheel` ships the `obabel` binary inside the venv. Run through `uv run` or activate `.venv/bin/activate` first so it's on `$PATH`.
-
-## Hardware notes
-
-| Task | GPU memory (rec.) |
-|---|---|
-| `predict`, single target, ≤100k compounds | 4-8 GB |
-| `predict`, large target (>3000 rec atoms) | 12+ GB, or reduce `--batch-size` |
-| `prepare` (CPU only, no GPU needed) | — |
-| Training (single GPU, base config) | 24 GB (RTX 3090 / A5000+) |
-| Training (DDP) | 8+ GB per GPU |
