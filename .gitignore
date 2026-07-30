@@ -19,6 +19,9 @@ runs/
 .codex
 .pytest_cache/
 
+# Internal docs (paper material, not for public repo)
+docs/
+
 # Large binary data (checkpoints, npz caches)
 *.pkl
 *.npz

@@ -80,7 +80,7 @@ Full reproduction scripts + benchmark-specific notes: see [BENCHMARKS.md](BENCHM
 - Trigonal attention crossover between the two
 - Outputs: motif labels on the grid, predicted key-atom positions, and a binding score for ranking
 
-Architecture details, loss composition, and training-time inputs: see `docs/`.
+Architecture, losses, and training-time input featurization are described in the manuscript (TODO: preprint link at publish time).
 
 ## ChEMBL data curation
 
@@ -111,11 +111,6 @@ Motifscreen-pub/
 │   ├── dude_bench_manifest.tsv
 │   ├── litpcba_bench_manifest.tsv
 │   └── chembl_bench_manifest.tsv
-├── docs/
-│   ├── model-architecture.md
-│   ├── input-features.md
-│   ├── outputs.md
-│   └── losses.md
 ├── INSTALL.md
 ├── INFERENCE.md
 └── BENCHMARKS.md
