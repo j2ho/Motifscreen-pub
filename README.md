@@ -61,8 +61,8 @@ tar xzf motifscreen_benchmarks.tar.gz
 
 # Score DUD-E
 uv run python motifscreen.py predict \
-    --datapath motifscreen_aff_benchmarks/dude_bench/prepared \
-    --checkpoint models/epoch70.pkl \
+    --datapath motifscreen_benchmarks/dude_bench/prepared \
+    --checkpoint {path_to_model_chkpt} \
     --base-config configs/training/endtoend.yaml \
     --gpus 0,1 \
     --output dude_scores.csv
@@ -114,9 +114,6 @@ Motifscreen-pub/
 └── BENCHMARKS.md
 ```
 
-## Citation
-
-TODO: preprint DOI at publish time.
 
 ## License
 

@@ -3,8 +3,8 @@
 Three benchmarks: **ChEMBL-LR-107** (our contribution, tercile-balanced by AVE bias), **DUD-E** (100 targets), **LIT-PCBA** (13 targets).
 
 Two paths to reproduce:
-- **A. Download the pre-featurized tarball** — fastest, paper-matching numbers, no user-side prep needed
-- **B. Run prepare + predict from scratch** — validates the full public pipeline on your machine
+- **A. Download the pre-featurized tarball**: fastest, paper-matching numbers, no user-side prep needed
+- **B. Run prepare + predict from scratch**: validates the full public pipeline on your machine
 
 Use path A if you just want to reproduce numbers. Use path B if you want to see what a fresh user run looks like end-to-end.
 
@@ -39,7 +39,7 @@ Both ship predict-ready (baked grid + prop + all_ligands.mol2 + keyatom.def):
 # DUD-E (100 targets, ~1.5M compounds; ~2-3 hr on 2 GPUs)
 uv run python motifscreen.py predict \
     --datapath motifscreen_aff_benchmarks/dude_bench/prepared \
-    --checkpoint models/epoch70.pkl \
+    --checkpoint {path_to_chkpt} \
     --base-config configs/training/endtoend.yaml \
     --gpus 0,1 \
     --output dude_scores.csv
@@ -47,7 +47,7 @@ uv run python motifscreen.py predict \
 # LIT-PCBA (13 targets, ~2.3M compounds; ~3-4 hr on 2 GPUs)
 uv run python motifscreen.py predict \
     --datapath motifscreen_aff_benchmarks/litpcba_bench/prepared \
-    --checkpoint models/epoch70.pkl \
+    --checkpoint {path_to_chkpt} \
     --base-config configs/training/endtoend.yaml \
     --gpus 0,1 \
     --output litpcba_scores.csv
@@ -68,7 +68,7 @@ bash scripts/download_and_prepare_chembl_bench.sh \
 
 uv run python motifscreen.py predict \
     --datapath motifscreen_aff_benchmarks/chembl_bench/prepared \
-    --checkpoint models/epoch70.pkl \
+    --checkpoint {path_to_chkpt} \
     --base-config configs/training/endtoend.yaml \
     --gpus 0,1 \
     --output chembl_scores.csv
@@ -100,12 +100,12 @@ bash scripts/download_dude_raw.sh --output data/dude_raw/
 
 # 2. Prep + predict (single script)
 bash scripts/run_dude_bench.sh \
-    --checkpoint models/epoch70.pkl \
+    --checkpoint {path_to_chkpt} \
     --raw-root data/dude_raw/ \
     --parallel 8
 ```
 
-Output at `results/dude_bench/`. Two of the canonical 102 DUD-E targets (`fgfr1`, `kif11`) are excluded due to incomplete raw data in the DUD-E distribution.
+Output at `results/dude_bench/`. 
 
 ### LIT-PCBA-14 from scratch
 
@@ -115,18 +115,17 @@ bash scripts/download_litpcba_raw.sh --output data/litpcba_raw/
 
 # 2. Prep + predict
 bash scripts/run_litpcba_bench.sh \
-    --checkpoint models/epoch70.pkl \
+    --checkpoint {path_to_chkpt} \
     --raw-root data/litpcba_raw/ \
     --parallel 8
 ```
 
-FEN1 is excluded because its LIT-PCBA-supplied mol2 conversion is incomplete. From-scratch reproduction gives all 14 remaining targets (MAPK1 works here — the v2 tarball only drops MAPK1 because its baked grid was unavailable at packaging time).
 
 ### ChEMBL-LR-107 from scratch
 
 ```bash
 bash scripts/download_and_prepare_chembl_bench.sh \
-    --checkpoint models/epoch70.pkl \
+    --checkpoint {path_to_chkpt} \
     --mode fresh \
     --parallel 8
 ```
@@ -134,18 +133,6 @@ bash scripts/download_and_prepare_chembl_bench.sh \
 Two modes:
 - `--mode fresh` (default): full reduce → featurize → predict. Reproduces the pipeline a public user gets on their own data.
 - `--mode reproduce`: overwrites the freshly-computed grid.npz + prop.npz with baked training-time files after prepare. Recovers exact paper numbers (matches tarball path A).
-
-### From-scratch vs tarball delta
-
-Running from scratch with `reduce` protonation gives slightly lower numbers than the baked tarball on some benchmarks:
-
-| Benchmark | Reduce-vs-baked mean ΔAUROC | Cause |
-|---|---|---|
-| ChEMBL-LR-107 | ~-0.00 to -0.02 | Same-pipeline reproduction |
-| DUD-E | ~-0.03 | Baked features used `score_jd2 -no_optH false` which assigns His tautomer states (HIE/HID/HIP) that reduce doesn't; slightly different pocket-atom charge assignment |
-| LIT-PCBA | ~-0.007 | Baked features also used reduce-like protonation; delta is essentially numerical noise |
-
-If you need exact paper-matching numbers on DUD-E specifically, use the tarball (path A).
 
 ---
 
@@ -179,7 +166,7 @@ bash scripts/prepare_batch.sh \
 
 uv run python motifscreen.py predict \
     --datapath my_prepared/ \
-    --checkpoint models/epoch70.pkl \
+    --checkpoint {path_to_chkpt} \
     --base-config configs/training/endtoend.yaml \
     --gpus 0,1 \
     --output my_scores.csv
@@ -194,17 +181,9 @@ uv run python motifscreen.py predict \
 
 ## Multi-GPU notes
 
-Predict uses one model replica per GPU with target-level parallelism. Empirical scaling:
-
-| GPUs | Aggregate throughput | Note |
-|---|---|---|
-| 1 | 40-60 compounds/sec | baseline |
-| 2 | 70-90 c/s | sweet spot, ~1.7× |
-| 3+ | ~100-120 c/s | diminishing returns (CPU featurization saturates) |
-
 Batch size caps by VRAM:
 - A6000 (48 GB): `--batch-size 64`
 - V100 (32 GB): `--batch-size 32`
 - T4 / smaller (16 GB): `--batch-size 16`
 
-For libraries >~100k compounds per target, the mol2 reader streams internally so memory stays bounded regardless of file size.
+
